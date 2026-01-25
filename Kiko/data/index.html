@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiko - AI Assistant</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1><span class="mic-icon">🎤</span> Kiko</h1>
+            <p>Smart Voice Assistant</p>
+        </div>
+        
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="status">Status</button>
+            <button class="tab-btn" data-tab="chat">Chat</button>
+            <button class="tab-btn" data-tab="gallery">Gallery</button>
+            <button class="tab-btn" data-tab="camera">Camera</button>
+            <button class="tab-btn" data-tab="tasks">Tasks</button>
+        </div>
+        
+        <!-- Status Tab -->
+        <div class="tab-content active" id="tab-status">
+            <div class="card">
+                <h2>Current State</h2>
+                <div style="text-align: center;">
+                    <div class="state-badge state-idle" id="stateBadge">Idle</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Live Transcription</h2>
+                <div id="transcription">Waiting for voice input...</div>
+            </div>
+        </div>
+        
+        <!-- Chat Tab -->
+        <div class="tab-content" id="tab-chat">
+            <div class="card">
+                <h2>Conversation History</h2>
+                <div id="chatList" class="empty">
+                    <p>No messages yet. Start talking to Kiko!</p>
+                </div>
+                <button class="btn btn-danger" onclick="clearChat()">Clear History</button>
+            </div>
+        </div>
+        
+        <!-- Gallery Tab -->
+        <div class="tab-content" id="tab-gallery">
+            <div class="card">
+                <h2>Captured Images</h2>
+                <div id="gallery" class="empty">
+                    <p>No images yet. Ask "What do you see?" to capture an image.</p>
+                </div>
+                <button class="btn btn-danger" onclick="clearGallery()">Clear Gallery</button>
+            </div>
+        </div>
+        
+        <!-- Camera Tab -->
+        <div class="tab-content" id="tab-camera">
+            <div class="card">
+                <h2>Live Camera Feed</h2>
+                <div id="cameraContainer" class="empty">
+                    <p>Camera not active. Enable surveillance mode to view.</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Tasks Tab -->
+        <div class="tab-content" id="tab-tasks">
+            <div class="card">
+                <h2>Active Alarm</h2>
+                <div id="alarmCountdown" class="alarm-inactive">No alarm set</div>
+                <button class="btn btn-danger" id="clearAlarmBtn" onclick="clearAlarm()" style="margin-top: 12px; display: none;">Clear Alarm</button>
+            </div>
+            
+            <div class="card">
+                <h2>To-Do Lists</h2>
+                <div id="todoLists" class="empty">
+                    <p>No to-do lists created yet.</p>
+                </div>
+                <button class="btn btn-danger" onclick="clearTodos()">Clear Todos</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- IDs for JavaScript Updates -->
+    <!-- State updates: #stateBadge -->
+    <!-- Chat updates: #chatList -->
+    <!-- Transcription updates: #transcription -->
+    <!-- Alarm updates: #alarmCountdown -->
+    <!-- Todo updates: #todoLists -->
+    <!-- Gallery updates: #gallery -->
+    <!-- Camera updates: #cameraContainer -->
+    
+    <script src="app.js"></script>
+</body>
+</html>
