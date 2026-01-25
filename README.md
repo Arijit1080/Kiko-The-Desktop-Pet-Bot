@@ -102,7 +102,7 @@ Capacitive sensing works with a **single wire**, no resistor required.
 
 ## 🖼️ Circuit Schematic
 
-![Kiko Circuit Schematic](kikoFlowchart.png)
+![Kiko Circuit Schematic](kikoSchematics.png)
 
 > Replace this image with your actual schematic image.
 
@@ -110,7 +110,7 @@ Capacitive sensing works with a **single wire**, no resistor required.
 
 ## 🔄 System Flowchart
 
-![Kiko System Flowchart](kikoSchematics.png)
+![Kiko System Flowchart](kikoFlowchart.png)
 
 ---
 
