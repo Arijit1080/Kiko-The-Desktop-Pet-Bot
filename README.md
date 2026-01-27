@@ -3,6 +3,8 @@
 *Kiko is a tiny AI-powered desktop companion that reacts to touch, shows emotions on a screen, and speaks back using a speaker.*
 
 ---
+![Kiko](/images/kiko.jpg)
+
 
 ## ✨ Overview
 
@@ -108,9 +110,13 @@ Capacitive sensing works with a **single wire**, no resistor required.
 
 ## 🔄 System Flowchart
 
-![Kiko System Flowchart](kikoFlowchart.png)
+![Kiko System Flowchart](/images/kikoFlowchart.png)
 
 ---
+
+## 🔄 System Dashboard
+
+![Kiko System Flowchart](/images/dashboard.jpg)
 
 ## 🔁 Working Logic
 
