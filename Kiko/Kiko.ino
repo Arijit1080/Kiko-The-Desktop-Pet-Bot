@@ -1,0 +1,3066 @@
+/*
+================================================================================
+  KIKO - AI Voice Assistant ESP32S3 Firmware
+================================================================================
+  Purpose: Complete firmware for AI voice assistant with speech recognition,
+           conversation engine, alarm scheduling, video streaming, and web UI.
+  
+  KEY FEATURES:
+  ✓ Voice: Record → Whisper transcription → GPT-4 chat → Google TTS playback
+  ✓ Alarms: Schedule with countdown, RTTTL audio, one-touch cancellation
+  ✓ Camera: OV3660 with MJPEG streaming and vision integration
+  ✓ Display: 128x64 OLED with animated eyes and status info
+  ✓ UI: Web dashboard with real-time WebSocket synchronization
+  ✓ Storage: Persistent chat history and todo lists in SPIFFS
+  ✓ Touch: Single/double-tap detection with multi-mode support
+  ✓ Networking: WiFi + OTA updates
+  
+  HARDWARE: Seeed XIAO ESP32S3 with OV3660 camera module
+  
+  CODE ORGANIZATION:
+  - Line 103:        Embedded web UI (HTML/CSS/JS in PROGMEM)
+  - Lines 1-450:     Configuration, includes, defines, data structures
+  - Lines 450-700:   Utility functions and state management
+  - Lines 700-1000:  WebSocket/HTTP broadcasting functions
+  - Lines 1000-1300: Initialization (setup)
+  - Lines 1300-1700: Audio processing pipeline (with state broadcast fixes)
+  - Lines 1700-2000: HTTP request handlers
+  - Lines 2000-2300: Main event loop
+  - Lines 2300-2700: Audio I/O (recording, transcription, TTS)
+  - Lines 2700+:     Display and animation engine
+  
+  MAIN FLOW:
+  1. User touches button → recordAudio() captures voice
+  2. Audio → transcribeWithWhisper() → text
+  3. Text → processAudio() → chatWithGpt() → response
+  4. Response → speakText() → TTS playback
+  5. All state changes broadcast via WebSocket to web clients
+  6. OLED updates show animated feedback
+  
+  DEPENDENCIES:
+  - Audio library (ESP32 audio streaming)
+  - WiFi & WebServer (HTTP/WebSocket)
+  - ArduinoJson (JSON parsing)
+  - U8g2lib (OLED graphics)
+  - SPIFFS (file storage)
+  - OTA (over-the-air updates)
+  - Camera library (esp_camera)
+================================================================================
+*/
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "Audio.h"
+#include <ESP_I2S.h>
+#include "secrets.h"
+#include "time.h"
+#include <WebServer.h>
+#include <vector>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <math.h>
+#include "esp_camera.h"
+#include "base64.h"
+#include <map>
+#include <SPIFFS.h>
+#include <WebSocketsServer.h>
+
+#define I2S_PDM_CLK_PIN 42
+#define I2S_PDM_DATA_PIN 41
+#define I2S_DOUT 6
+#define I2S_BCLK 5
+#define I2S_LRC 7
+#define BUTTON_PIN 4
+#define RGB_RED_PIN 2
+#define RGB_GREEN_PIN 1
+#define RGB_BLUE_PIN 3
+#define OLED_SDA_PIN 8
+#define OLED_SCL_PIN 9
+#define TOUCH_THRESHOLD 24000
+
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 10
+#define SIOD_GPIO_NUM 40
+#define SIOC_GPIO_NUM 39
+#define Y9_GPIO_NUM 48
+#define Y8_GPIO_NUM 11
+#define Y7_GPIO_NUM 12
+#define Y6_GPIO_NUM 14
+#define Y5_GPIO_NUM 16
+#define Y4_GPIO_NUM 18
+#define Y3_GPIO_NUM 17
+#define Y2_GPIO_NUM 15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM 47
+#define PCLK_GPIO_NUM 13
+
+// ========== EMBEDDED WEB FILES (For Arduino IDE compatibility without SPIFFS) ==========
+const char INDEX_HTML[] PROGMEM = R"EMBEDDEDHTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiko - AI Assistant</title>
+    <style>
+:root{--bg-dark:#0a0e27;--bg-card:#1e2139;--primary:#00d4ff;--primary-light:#4fc1ff;--accent:#667eea;--text-main:#e8eaed;--text-dim:#999;--state-idle:#667eea;--state-listening:#f5576c;--state-thinking:#ffa500;--state-speaking:#43e97b;--state-alarm:#fa709a;--state-surveillance:#ff3333;--border-glow:rgba(0,212,255,.2);--border-glow-strong:rgba(0,212,255,.4)}*{margin:0;padding:0;box-sizing:border-box}html{font-size:16px}body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,var(--bg-dark) 0%,#0f1432 100%);color:var(--text-main);line-height:1.6;min-height:100vh;overflow-x:hidden}.container{max-width:1200px;margin:0 auto;padding:20px}.header{background:linear-gradient(135deg,rgba(0,212,255,.12) 0%,rgba(79,193,255,.08) 100%);padding:40px 30px;border-radius:16px;border:1px solid var(--border-glow);margin-bottom:30px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.3),inset 0 1px 1px rgba(255,255,255,.1);backdrop-filter:blur(10px)}.header h1{font-size:clamp(2em,5vw,3em);color:var(--primary);margin-bottom:8px;font-weight:700;letter-spacing:2px;text-shadow:0 0 20px rgba(0,212,255,.4)}.header p{color:var(--primary-light);font-size:.95em;letter-spacing:1px}.mic-icon{display:inline-block;font-size:1.3em;margin-right:12px;animation:float 3s ease-in-out infinite}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}.tabs{display:flex;gap:8px;margin-bottom:30px;border-bottom:2px solid var(--border-glow);padding-bottom:12px;overflow-x:auto;scroll-behavior:smooth}.tabs::-webkit-scrollbar{height:4px}.tabs::-webkit-scrollbar-track{background:0}.tabs::-webkit-scrollbar-thumb{background:var(--primary);border-radius:2px}.tab-btn{background:0;color:var(--text-dim);border:none;padding:12px 24px;cursor:pointer;font-size:.95em;font-weight:500;border-bottom:3px solid transparent;transition:all .3s cubic-bezier(.4,0,.2,1);white-space:nowrap;position:relative}.tab-btn:hover{color:var(--primary)}.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary)}.tab-btn.active::after{content:'';position:absolute;bottom:-12px;left:0;right:0;height:1px;background:radial-gradient(ellipse at center,var(--primary) 0%,transparent 70%);filter:blur(1px)}.tab-content{display:none;animation:fadeInDown .4s cubic-bezier(.4,0,.2,1)}.tab-content.active{display:block}@keyframes fadeInDown{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}.card{background:rgba(30,33,57,.8);border:1px solid var(--border-glow);border-radius:14px;padding:28px;margin-bottom:25px;box-shadow:0 10px 40px rgba(0,0,0,.3),inset 0 1px 1px rgba(255,255,255,.05);backdrop-filter:blur(10px);transition:all .3s cubic-bezier(.4,0,.2,1)}.card:hover{border-color:var(--border-glow-strong);box-shadow:0 15px 50px rgba(0,212,255,.15),inset 0 1px 1px rgba(255,255,255,.05)}.card h2{color:var(--primary);font-size:1.35em;margin-bottom:18px;display:flex;align-items:center;gap:12px;font-weight:600;letter-spacing:.5px}.card h2::before{content:'';display:inline-block;width:4px;height:1.3em;background:linear-gradient(180deg,var(--primary) 0%,var(--primary-light) 100%);border-radius:2px}.state-badge{display:inline-block;padding:16px 36px;border-radius:30px;font-size:clamp(1em,2.5vw,1.2em);font-weight:700;text-align:center;margin:20px auto;letter-spacing:1px;box-shadow:0 8px 25px rgba(0,0,0,.3);transition:all .3s ease;text-transform:uppercase}.state-idle{background:linear-gradient(135deg,var(--state-idle) 0%,#8b9ef6 100%);color:#fff;box-shadow:0 8px 25px rgba(102,126,234,.3)}.state-listening{background:linear-gradient(135deg,var(--state-listening) 0%,#ff7a8e 100%);color:#fff;box-shadow:0 0 25px rgba(245,87,108,.5);animation:pulse-listening 1s ease-in-out infinite}@keyframes pulse-listening{0%,100%{box-shadow:0 0 25px rgba(245,87,108,.5)}50%{box-shadow:0 0 50px rgba(245,87,108,.8)}}.state-thinking{background:linear-gradient(135deg,var(--state-thinking) 0%,#ffb84d 100%);color:#000;box-shadow:0 0 25px rgba(255,165,0,.5);animation:pulse-thinking 1.5s ease-in-out infinite}@keyframes pulse-thinking{0%,100%{box-shadow:0 0 25px rgba(255,165,0,.5)}50%{box-shadow:0 0 50px rgba(255,165,0,.8)}}.state-speaking{background:linear-gradient(135deg,var(--state-speaking) 0%,#61f5a6 100%);color:#000;box-shadow:0 8px 25px rgba(67,233,123,.4);animation:pulse-speaking .8s ease-in-out infinite}@keyframes pulse-speaking{0%,100%{box-shadow:0 8px 25px rgba(67,233,123,.4)}50%{box-shadow:0 8px 40px rgba(67,233,123,.7)}}.state-alarming{background:linear-gradient(135deg,var(--state-alarm) 0%,#ff5a82 100%);color:#fff;box-shadow:0 0 25px rgba(250,112,154,.6);animation:pulse-alarm .5s ease-in-out infinite;font-size:1.4em;font-weight:800}@keyframes pulse-alarm{0%,100%{box-shadow:0 0 25px rgba(250,112,154,.6);transform:scale(1)}50%{box-shadow:0 0 50px rgba(250,112,154,1);transform:scale(1.02)}}@keyframes alarm-ring{0%,100%{box-shadow:0 0 40px rgba(255,59,48,.6),inset 0 0 20px rgba(255,59,48,.2);transform:scale(1)}50%{box-shadow:0 0 60px rgba(255,59,48,.9),inset 0 0 30px rgba(255,59,48,.4);transform:scale(1.03)}}.state-surveillance{background:linear-gradient(135deg,var(--state-surveillance) 0%,#ff6666 100%);color:#fff;box-shadow:0 0 30px rgba(255,51,51,.6);border:2px solid var(--state-surveillance)}#transcription{background:rgba(0,212,255,.08);padding:18px;border-radius:10px;min-height:50px;border:2px dashed var(--primary);font-style:italic;color:var(--primary-light);font-size:.95em;word-wrap:break-word;transition:all .3s ease}#transcription.active{background:rgba(0,212,255,.15);border-style:solid;border-color:var(--primary);box-shadow:inset 0 0 15px rgba(0,212,255,.1)}#chatList{max-height:450px;overflow-y:auto;border:1px solid var(--border-glow);border-radius:10px;padding:15px;background:rgba(0,0,0,.2)}#chatList::-webkit-scrollbar{width:6px}#chatList::-webkit-scrollbar-track{background:rgba(0,212,255,.05);border-radius:3px}#chatList::-webkit-scrollbar-thumb{background:rgba(0,212,255,.3);border-radius:3px}#chatList::-webkit-scrollbar-thumb:hover{background:rgba(0,212,255,.5)}.chat-msg{padding:12px 16px;margin-bottom:12px;border-radius:10px;word-wrap:break-word;animation:slideIn .3s ease;display:flex;align-items:flex-start;gap:10px}@keyframes slideIn{from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:translateX(0)}}.msg-icon{font-size:1.5em;min-width:24px;text-align:center;flex-shrink:0}.msg-text{flex:1;word-wrap:break-word}.chat-user{background:linear-gradient(135deg,rgba(102,126,234,.2) 0%,rgba(118,75,162,.1) 100%);border-left:3px solid var(--accent);justify-content:flex-end;flex-direction:row-reverse}.chat-user .msg-icon{color:var(--accent)}.chat-ai{background:linear-gradient(135deg,rgba(0,212,255,.15) 0%,rgba(79,193,255,.08) 100%);border-left:3px solid var(--primary)}.chat-ai .msg-icon{color:var(--primary)}#alarmCountdown{font-size:clamp(2em,6vw,3em);font-weight:900;color:var(--state-alarm);text-align:center;font-family:'Courier New',monospace;padding:24px;background:linear-gradient(135deg,rgba(255,107,107,.12) 0%,rgba(255,193,7,.08) 100%);border-radius:12px;border:2px solid rgba(255,107,107,.3);letter-spacing:2px;transition:all .3s ease}#alarmCountdown.active{box-shadow:0 0 30px rgba(250,112,154,.4),inset 0 0 15px rgba(255,107,107,.1);animation:pulse-alarm .6s ease-in-out infinite}#alarmCountdown.alarm-ringing{background:linear-gradient(135deg,rgba(255,59,48,.25) 0%,rgba(255,87,34,.15) 100%);border-color:rgba(255,59,48,.6);box-shadow:0 0 40px rgba(255,59,48,.6),inset 0 0 20px rgba(255,59,48,.2);animation:alarm-ring .4s ease-in-out infinite}#alarmCountdown.alarm-about-to-ring{background:linear-gradient(135deg,rgba(255,152,0,.2) 0%,rgba(255,193,7,.15) 100%);border-color:rgba(255,193,7,.5);animation:pulse-alarm .5s ease-in-out infinite}.alarm-inactive{color:var(--state-speaking);font-size:1.1em;animation:none;box-shadow:none}.todo-list{background:linear-gradient(135deg,rgba(0,212,255,.08) 0%,rgba(79,193,255,.05) 100%);padding:18px;border-radius:10px;border-left:4px solid var(--primary);margin-bottom:18px;box-shadow:inset 0 1px 1px rgba(255,255,255,.05);transition:all .3s ease}.todo-list:hover{background:linear-gradient(135deg,rgba(0,212,255,.12) 0%,rgba(79,193,255,.08) 100%);border-left-color:var(--primary-light)}.todo-list h3{color:var(--primary);font-size:1.05em;margin-bottom:12px;text-transform:capitalize;font-weight:600}.todo-item{padding:10px 12px;background:rgba(255,255,255,.03);border-radius:6px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;font-size:.95em;transition:all .2s ease;border-left:2px solid var(--primary-light)}.todo-item:hover{background:rgba(255,255,255,.06);padding-left:14px}.todo-item .qty{background:linear-gradient(135deg,var(--primary) 0%,var(--primary-light) 100%);color:#000;padding:3px 10px;border-radius:12px;font-weight:700;font-size:.8em;min-width:35px;text-align:center;box-shadow:0 4px 12px rgba(0,212,255,.2)}#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px;max-height:550px;overflow-y:auto}#gallery::-webkit-scrollbar{width:6px}#gallery::-webkit-scrollbar-track{background:rgba(0,212,255,.05)}#gallery::-webkit-scrollbar-thumb{background:rgba(0,212,255,.3);border-radius:3px}.gallery-item{border-radius:12px;overflow:hidden;border:2px solid var(--border-glow);transition:all .3s cubic-bezier(.4,0,.2,1);box-shadow:0 8px 20px rgba(0,0,0,.3)}.gallery-item:hover{border-color:var(--primary);box-shadow:0 12px 40px rgba(0,212,255,.2);transform:translateY(-4px)}.gallery-item img{width:100%;height:auto;display:block;transition:transform .3s ease}.gallery-item:hover img{transform:scale(1.05)}#cameraContainer{position:relative;border-radius:12px;overflow:hidden;border:2px solid var(--border-glow);box-shadow:0 10px 40px rgba(0,0,0,.3)}#cameraContainer.active{border-color:var(--state-surveillance);box-shadow:0 0 30px rgba(255,51,51,.3)}#cameraFeed{width:100%;height:auto;display:block;border-radius:10px;border:1px solid var(--border-glow)}.btn{background:rgba(0,212,255,.15);color:var(--primary);border:1.5px solid var(--primary);padding:12px 28px;border-radius:8px;cursor:pointer;font-size:.9em;font-weight:600;transition:all .3s cubic-bezier(.4,0,.2,1);margin-top:18px;letter-spacing:.5px}.btn:hover{background:rgba(0,212,255,.25);box-shadow:0 6px 20px rgba(0,212,255,.2);transform:translateY(-2px)}.btn:active{transform:translateY(0);box-shadow:0 3px 10px rgba(0,212,255,.15)}.btn-danger{background:rgba(255,107,107,.15);color:#ff6b6b;border-color:#ff6b6b}.btn-danger:hover{background:rgba(255,107,107,.25);box-shadow:0 6px 20px rgba(255,107,107,.2)}.empty{text-align:center;padding:50px 20px;color:var(--text-dim)}.empty p{margin:10px 0;font-size:.95em}@media (max-width:768px){.container{padding:15px}.header{padding:25px 20px;margin-bottom:20px}.header h1{font-size:1.8em}.card{padding:18px;margin-bottom:18px}.card h2{font-size:1.15em;margin-bottom:12px}.tabs{gap:4px;margin-bottom:20px;padding-bottom:8px}.tab-btn{padding:10px 16px;font-size:.85em}.state-badge{padding:12px 24px;font-size:1em}#chatList{max-height:300px}#gallery{grid-template-columns:1fr;max-height:400px}#alarmCountdown{font-size:2em;padding:18px}.btn{padding:10px 20px;font-size:.85em}}@media (max-width:480px){html{font-size:14px}.container{padding:12px}.header{padding:20px 15px}.header h1{font-size:1.5em}.card{padding:15px}.tabs{gap:2px}.tab-btn{padding:8px 12px;font-size:.75em}#transcription{font-size:.85em}.state-badge{padding:10px 18px;font-size:.9em}}@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><span class="mic-icon">🎤</span> Kiko</h1>
+            <p>Smart Voice Assistant</p>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="status">Status</button>
+            <button class="tab-btn" data-tab="chat">Chat</button>
+            <button class="tab-btn" data-tab="gallery">Gallery</button>
+            <button class="tab-btn" data-tab="camera">Camera</button>
+            <button class="tab-btn" data-tab="tasks">Tasks</button>
+        </div>
+        
+        <div class="tab-content active" id="tab-status">
+            <div class="card">
+                <h2>Current State</h2>
+                <div style="text-align: center;">
+                    <div class="state-badge state-idle" id="stateBadge">Idle</div>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Live Transcription</h2>
+                <div id="transcription">Waiting for voice input...</div>
+            </div>
+        </div>
+        
+        <div class="tab-content" id="tab-chat">
+            <div class="card">
+                <h2>Conversation History</h2>
+                <div id="chatList" class="empty"><p>No messages yet.</p></div>
+                <button class="btn btn-danger" onclick="clearChat()">Clear History</button>
+            </div>
+        </div>
+        
+        <div class="tab-content" id="tab-gallery">
+            <div class="card">
+                <h2>Captured Images</h2>
+                <div id="gallery" class="empty"><p>No images yet.</p></div>
+                <button class="btn btn-danger" onclick="clearGallery()">Clear Gallery</button>
+            </div>
+        </div>
+        
+        <div class="tab-content" id="tab-camera">
+            <div class="card">
+                <h2>Live Camera Feed</h2>
+                <div id="cameraContainer" class="empty"><p>Camera not active.</p></div>
+            </div>
+        </div>
+        
+        <div class="tab-content" id="tab-tasks">
+            <div class="card">
+                <h2>Active Alarm</h2>
+                <div id="alarmCountdown" class="alarm-inactive">No alarm set</div>
+                <button class="btn btn-danger" id="clearAlarmBtn" onclick="clearAlarm()" style="margin-top: 12px; display: none;">Clear Alarm</button>
+            </div>
+            <div class="card">
+                <h2>To-Do Lists</h2>
+                <div id="todoLists" class="empty"><p>No lists.</p></div>
+                <button class="btn btn-danger" onclick="clearTodos()">Clear Todos</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+const state={currentTab:'status',ws:null,wsAttempts:0,maxWsAttempts:10,wsRetryDelay:3000,lastState:null,alarmInterval:null};document.addEventListener('DOMContentLoaded',()=>{initTabNavigation();initWebSocket();updateUI()});function initWebSocket(){const protocol=window.location.protocol==='https:'?'wss:':'ws:';const host=window.location.hostname;const wsUrl=protocol+'//'+host+':81';try{state.ws=new WebSocket(wsUrl);state.ws.onopen=()=>{console.log('Connected');state.wsAttempts=0;updateStatusIndicator(true)};state.ws.onmessage=(event)=>{try{const data=JSON.parse(event.data);handleMessage(data)}catch(e){console.error('Failed to parse message:',e)}};state.ws.onerror=(error)=>{console.error('WebSocket error:',error);updateStatusIndicator(false)};state.ws.onclose=()=>{console.log('Disconnected');updateStatusIndicator(false);reconnectWebSocket()}}catch(e){console.error('Failed to create WebSocket:',e);reconnectWebSocket()}}function reconnectWebSocket(){if(state.wsAttempts<state.maxWsAttempts){state.wsAttempts++;setTimeout(()=>{initWebSocket()},state.wsRetryDelay)}}function handleMessage(data){if(data.history&&Array.isArray(data.history)){const chatList=document.getElementById('chatList');if(chatList){chatList.innerHTML='';const filteredMessages=data.history.filter(msg=>msg.role==='user'||msg.role==='assistant');if(filteredMessages.length===0){chatList.innerHTML='<p class="empty">No messages yet.</p>'}else{const lastMessages=filteredMessages.slice(-10);lastMessages.forEach(msg=>{addChatMessage(msg.role,msg.content)})}}}if(data.state)updateState(data.state);if(data.transcript!==undefined)updateTranscription(data.transcript);if(data.alarm_time!==undefined||data.alarm!==undefined||data.is_ringing!==undefined){updateAlarm(data.alarm_time,data.alarm,data.is_ringing,data.remaining)}if(data.lists)updateTodoLists(data.lists);if(data.camera_mode!==undefined)updateCameraMode(data.camera_mode);if(data.message)addChatMessage(data.message.role,data.message.content);if(data.image_ready)loadLastCapturedImage();if(data.gallery&&Array.isArray(data.gallery)){const gallery=document.getElementById('gallery');if(gallery){gallery.innerHTML='';if(data.gallery.length===0){gallery.innerHTML='<div class="empty"><p>No images yet.</p></div>'}}}if(data.image_url)addGalleryImage(data.image_url)}function updateState(newState){if(state.lastState===newState)return;state.lastState=newState;const badge=document.getElementById('stateBadge');if(!badge)return;badge.textContent=newState;badge.className='state-badge';const stateMap={'idle':'state-idle','listening':'state-listening','thinking':'state-thinking','speaking':'state-speaking','alarming':'state-alarming','surveillance':'state-surveillance'};badge.classList.add(stateMap[newState.toLowerCase()]||'state-idle')}function updateTranscription(text){const element=document.getElementById('transcription');if(!element)return;if(text.trim()){element.textContent=text;element.classList.add('active')}else{element.textContent='Waiting for voice input...';element.classList.remove('active')}}function updateAlarm(alarmTime,isActive,isRinging,serverRemaining){const element=document.getElementById('alarmCountdown');const clearBtn=document.getElementById('clearAlarmBtn');if(!element)return;if(state.alarmInterval){clearInterval(state.alarmInterval);state.alarmInterval=null}if(!isActive||!alarmTime){element.textContent='No alarm set';element.className='alarm-inactive';if(clearBtn)clearBtn.style.display='none';return}if(clearBtn)clearBtn.style.display='block';if(isRinging){element.textContent='ALARM';element.classList.remove('alarm-inactive');element.classList.add('alarm-ringing');return}element.classList.remove('alarm-inactive','alarm-ringing');element.classList.add('active');let baseRemaining=serverRemaining?serverRemaining*1000:0;let lastUpdateTime=Date.now();function updateCountdown(){const now=Date.now();const elapsed=now-lastUpdateTime;baseRemaining=Math.max(0,baseRemaining-elapsed);lastUpdateTime=now;if(baseRemaining<=0){element.textContent='00:00';element.classList.add('alarm-about-to-ring');clearInterval(state.alarmInterval);return}const minutes=Math.floor(baseRemaining/60000);const seconds=Math.floor((baseRemaining%60000)/1000);element.textContent=String(minutes).padStart(2,'0')+':'+String(seconds).padStart(2,'0')}updateCountdown();state.alarmInterval=setInterval(updateCountdown,1000)}function clearAlarm(){showConfirm('Cancel alarm?',async ()=>{try{const response=await fetch('/api/alarm/cancel',{method:'POST'});if(response.ok){const clearBtn=document.getElementById('clearAlarmBtn');if(clearBtn)clearBtn.style.display='none'}}catch(e){console.error('Failed:',e)}},'Cancel')}function updateTodoLists(lists){const container=document.getElementById('todoLists');if(!container)return;if(!lists||Object.keys(lists).length===0){container.innerHTML='<div class="empty"><p>No lists yet.</p></div>';return}let html='';for(const[listName,items]of Object.entries(lists)){html+='<div class="todo-list"><h3>'+escapeHtml(listName)+'</h3>';if(items&&Object.keys(items).length>0){html+='<div>';for(const[itemName,quantity]of Object.entries(items)){const qty=parseInt(quantity)||0;html+='<div class="todo-item"><span>'+escapeHtml(itemName)+'</span><span class="qty">('+qty+')</span></div>'}html+='</div>'}else{html+='<p style="color:#999;">Empty</p>'}html+='</div>'}container.innerHTML=html}function updateCameraMode(mode){const container=document.getElementById('cameraContainer');if(!container)return;if(window.cameraRefreshInterval){clearInterval(window.cameraRefreshInterval);window.cameraRefreshInterval=null}if(mode==='live'||mode==='surveillance'){container.innerHTML='<img id="cameraFeed" src="/stream" alt="Camera" style="width: 100%; border-radius: 8px; margin-top: 10px;">';container.classList.add('active');switchTab('camera')}else{container.classList.remove('active');container.innerHTML='<div class="empty"><p>Camera inactive.</p></div>'}}function addChatMessage(role,content){if(role!=='user'&&role!=='assistant')return;const list=document.getElementById('chatList');if(!list)return;if(role==='assistant'){try{const parsed=JSON.parse(content);if(parsed.tool_calls)return}catch(e){}}const empty=list.querySelector('.empty');if(empty)empty.remove();const msg=document.createElement('div');msg.className='chat-msg chat-'+(role==='user'?'user':'ai');const icon=role==='user'?'👤':'🤖';msg.innerHTML='<span class="msg-icon">'+icon+'</span><span class="msg-text">'+escapeHtml(content)+'</span>';const chatMessages=list.querySelectorAll('.chat-msg');if(chatMessages.length>=10)chatMessages[0].remove();list.appendChild(msg);list.scrollTop=list.scrollHeight}function escapeHtml(text){const map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'};return text.replace(/[&<>"']/g,m=>map[m])}function clearChat(){showConfirm('Clear chat?',async ()=>{await fetch('/clear_chat');document.getElementById('chatList').innerHTML='<p class="empty">No messages.</p>'})}function loadLastCapturedImage(){const gallery=document.getElementById('gallery');if(!gallery)return;const img=document.createElement('img');img.src='/last_image.jpg?t='+Date.now();img.alt='Image';const existing=gallery.querySelector('img');const empty=gallery.querySelector('.empty');if(existing)existing.remove();if(empty)empty.remove();gallery.appendChild(img);switchTab('gallery')}function addGalleryImage(imageUrl){const gallery=document.getElementById('gallery');if(!gallery)return;const empty=gallery.querySelector('.empty');if(empty)empty.remove();const item=document.createElement('div');item.className='gallery-item';item.innerHTML='<img src="'+escapeHtml(imageUrl)+'" alt="Image">';gallery.appendChild(item)}function clearGallery(){showConfirm('Clear gallery?',async ()=>{await fetch('/clear_gallery');document.getElementById('gallery').innerHTML='<p class="empty">No images.</p>'})}function clearTodos(){showConfirm('Clear todos?',async ()=>{await fetch('/clear_todos');document.getElementById('todoLists').innerHTML='<div class="empty"><p>No lists.</p></div>'})}function initTabNavigation(){const buttons=document.querySelectorAll('.tab-btn');buttons.forEach(btn=>{btn.addEventListener('click',()=>{const tab=btn.getAttribute('data-tab');switchTab(tab)})})}function switchTab(tabName){state.currentTab=tabName;document.querySelectorAll('.tab-btn').forEach(btn=>{if(btn.getAttribute('data-tab')===tabName){btn.classList.add('active')}else{btn.classList.remove('active')}});document.querySelectorAll('.tab-content').forEach(content=>{if(content.id==='tab-'+tabName){content.classList.add('active')}else{content.classList.remove('active')}})}function sendMessage(data){if(state.ws&&state.ws.readyState===WebSocket.OPEN){state.ws.send(JSON.stringify(data))}}function updateStatusIndicator(connected){console.log(connected?'Connected':'Disconnected')}function updateUI(){const transcription=document.getElementById('transcription');if(transcription)transcription.textContent='Waiting...';const alarm=document.getElementById('alarmCountdown');if(alarm){alarm.textContent='No alarm';alarm.className='alarm-inactive'}const chat=document.getElementById('chatList');if(chat)chat.innerHTML='<p class="empty">No messages.</p>';const gallery=document.getElementById('gallery');if(gallery)gallery.innerHTML='<p class="empty">No images.</p>';const todos=document.getElementById('todoLists');if(todos)todos.innerHTML='<div class="empty"><p>No lists.</p></div>';const camera=document.getElementById('cameraContainer');if(camera)camera.innerHTML='<div class="empty"><p>Inactive.</p></div>';const badge=document.getElementById('stateBadge');if(badge){badge.textContent='Idle';badge.className='state-badge state-idle'}}setInterval(()=>{if(state.ws&&state.ws.readyState===WebSocket.OPEN&&state.lastState!=='Surveillance'){sendMessage({type:'ping'})}},30000);setInterval(()=>{if(state.ws&&state.ws.readyState===WebSocket.OPEN){sendMessage({type:'refresh_chat'});sendMessage({type:'refresh_gallery'})}},5000);function showConfirm(message,onConfirm,buttonText='Proceed'){if(confirm(message))onConfirm()}if(typeof module!=='undefined'&&module.exports){module.exports={updateState,addChatMessage,switchTab}}
+    </script>
+</body>
+</html>
+)EMBEDDEDHTML";
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+std::vector<String> transactionHistory; 
+int alarmUpdateCounter = 0;   
+const int MAX_HISTORY_SIZE = 10;    
+std::map<String, std::map<String, int>> todoLists;
+
+struct ChatMessage {
+  String role;
+  String content;
+  String tool_call_id; 
+};
+std::vector<ChatMessage> chatHistory;
+const int MAX_HISTORY_MESSAGES = 50; 
+
+
+struct GptToolCall {
+  String toolToCall;
+  String toolArguments;
+  String toolCallId;
+};
+
+struct GptResponse {
+  String textToSpeak;
+  std::vector<GptToolCall> toolCalls; 
+  String rawAssistantMessage; 
+};
+
+const char DEFAULT_INTRODUCTION[] PROGMEM = "Hello, I'm Kiko, your AI assistant, ready to help, What would you like me to do?";
+
+std::vector<uint8_t> lastCapturedImage;
+int imageCaptureCounter = 0;
+volatile bool cameraInUse = false;
+volatile bool inSurveillanceMode = false;
+
+volatile bool streamTaskRunning = false;
+WiFiClient* streamClient = nullptr;
+TaskHandle_t streamTaskHandle = nullptr;
+
+unsigned long alarmTriggerTime = 0;
+unsigned long alarmLoopStartTime = 0;
+bool alarmSoundStarted = false;
+unsigned long lastTapTime = 0;
+#define DOUBLE_TAP_TIME_MS 400
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+const unsigned char time_date_icon[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x1f, 0x00, 0x00, 0xf8, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc0, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0x03, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf8, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xc0, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0x03, 0x00, 0x00, 
+  0x00, 0x00, 0xf0, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x0f, 0x00, 0x00, 
+  0x00, 0x00, 0xfc, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0x00, 0x00, 
+  0x00, 0x00, 0xfe, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x7f, 0x00, 0x00, 
+  0x00, 0x80, 0xff, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x60, 0x00, 0x00, 0x80, 0xff, 0x01, 0x00, 
+  0x00, 0xc0, 0xff, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x01, 0x00, 0x00, 0xff, 0x03, 0x00, 
+  0x00, 0xe0, 0x3f, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0x00, 0x00, 0xfc, 0x07, 0x00, 
+  0x00, 0xf8, 0x1f, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0x00, 0x00, 0xf8, 0x0f, 0x00, 
+  0x00, 0xfc, 0x0f, 0x00, 0xf8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x00, 0xf0, 0x3f, 0x00, 
+  0x00, 0xfe, 0x03, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00, 0xc0, 0x7f, 0x00, 
+  0x00, 0xfe, 0x01, 0x00, 0x0f, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0xf0, 0x00, 0x80, 0x7f, 0x00, 
+  0x00, 0xff, 0x00, 0x80, 0x07, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0xe0, 0x01, 0x00, 0xff, 0x00, 
+  0x80, 0x7f, 0x00, 0x80, 0x07, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0xe0, 0x01, 0x00, 0xfe, 0x01, 
+  0x80, 0x7f, 0x00, 0x80, 0x07, 0x00, 0x7f, 0x00, 0x00, 0xf8, 0x03, 0xe0, 0x01, 0x00, 0xfe, 0x01, 
+  0xc0, 0x3f, 0x00, 0x80, 0x07, 0x00, 0x3e, 0x00, 0x00, 0xf0, 0x01, 0xe0, 0x01, 0x00, 0xfc, 0x03, 
+  0xe0, 0x3f, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0xfc, 0x07, 
+  0xe0, 0x1f, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0xf8, 0x07, 
+  0xe0, 0x1f, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0xf8, 0x07, 
+  0xf0, 0x1f, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0xf8, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0xe0, 0x7f, 0xfe, 0x07, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x0f, 0x00, 0x80, 0x07, 0x00, 0xf0, 0x7f, 0xfe, 0x0f, 0x00, 0xe0, 0x01, 0x00, 0xf0, 0x0f, 
+  0xf0, 0x1f, 0x00, 0x80, 0x07, 0x00, 0xfc, 0x7f, 0xfe, 0x3f, 0x00, 0xe0, 0x01, 0x00, 0xf8, 0x0f, 
+  0xe0, 0x1f, 0x00, 0x80, 0x07, 0x00, 0xfc, 0x7f, 0xfe, 0x3f, 0x00, 0xe0, 0x01, 0x00, 0xf8, 0x07, 
+  0xe0, 0x1f, 0x00, 0x80, 0x07, 0x00, 0xfe, 0x7f, 0xfe, 0x7f, 0x00, 0xe0, 0x01, 0x00, 0xf8, 0x07, 
+  0xe0, 0x3f, 0x00, 0x80, 0x07, 0x00, 0x3e, 0x00, 0xfe, 0x7f, 0x00, 0xe0, 0x01, 0x00, 0xfc, 0x07, 
+  0xc0, 0x3f, 0x00, 0x80, 0x07, 0x00, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0xe0, 0x01, 0x00, 0xfc, 0x03, 
+  0x80, 0x7f, 0x00, 0x80, 0x07, 0x00, 0xfc, 0xff, 0xff, 0x3f, 0x00, 0xe0, 0x01, 0x00, 0xfe, 0x01, 
+  0x80, 0x7f, 0x00, 0x80, 0x07, 0x00, 0xfc, 0xff, 0xff, 0x3f, 0x00, 0xe0, 0x01, 0x00, 0xfe, 0x01, 
+  0x00, 0xff, 0x00, 0x80, 0x07, 0x00, 0xf8, 0xff, 0xff, 0x1f, 0x00, 0xe0, 0x01, 0x00, 0xff, 0x00, 
+  0x00, 0xfe, 0x01, 0x80, 0x07, 0x00, 0xe0, 0xff, 0xff, 0x07, 0x00, 0xe0, 0x01, 0x80, 0x7f, 0x00, 
+  0x00, 0xfe, 0x03, 0x80, 0x07, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0xe0, 0x01, 0xc0, 0x7f, 0x00, 
+  0x00, 0xfc, 0x0f, 0x80, 0x07, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0xe0, 0x01, 0xf0, 0x3f, 0x00, 
+  0x00, 0xf8, 0x1f, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0xf8, 0x1f, 0x00, 
+  0x00, 0xe0, 0x3f, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x00, 0xfc, 0x07, 0x00, 
+  0x00, 0xc0, 0xff, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00, 0xff, 0x03, 0x00, 
+  0x00, 0x80, 0xff, 0x01, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0x80, 0xff, 0x01, 0x00, 
+  0x00, 0x00, 0xfe, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x7f, 0x00, 0x00, 
+  0x00, 0x00, 0xfc, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0x00, 0x00, 
+  0x00, 0x00, 0xf0, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x0f, 0x00, 0x00, 
+  0x00, 0x00, 0xc0, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0x03, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf8, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc0, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0x03, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x1f, 0x00, 0x00, 0xf8, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+bool isTimeDateTask = false;
+
+const unsigned char mic_icon[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc0, 0x07, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xe0, 0x03, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf8, 0x1f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xf8, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x3f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfc, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0x01, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x7f, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0xff, 0x00, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf8, 0xff, 0x00, 0xfc, 0xff, 0xff, 0x3f, 0x00, 0xff, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf8, 0xff, 0x01, 0xf8, 0xff, 0xff, 0x1f, 0x80, 0xff, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf0, 0xff, 0x03, 0xe0, 0xff, 0xff, 0x07, 0xc0, 0xff, 0x0f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xe0, 0xff, 0x0f, 0x00, 0xff, 0xff, 0x00, 0xf0, 0xff, 0x07, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc0, 0xff, 0x1f, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xff, 0x03, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x80, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x03, 0x00, 0x00, 0xc0, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0x3f, 0x00, 0x00, 0xfc, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+const unsigned char weather_icon[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x38, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xff, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x1f, 0x00, 0xf8, 0x03, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0x1f, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xe0, 0x1f, 0x00, 0xf0, 0x07, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0xf8, 0x03, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x78, 0x00, 0xff, 0x0f, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x78, 0x00, 0xff, 0x07, 0x00, 
+  0x00, 0x00, 0x00, 0x80, 0x0f, 0x00, 0x00, 0x00, 0xe0, 0xf3, 0x03, 0x78, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff, 0x70, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x80, 0x01, 0xe0, 0x0f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xc0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0xc0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x80, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x1f, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+bool isWeatherTask = false;
+
+#define FRAME_DELAY (42)
+#define FRAME_WIDTH (48)
+#define FRAME_HEIGHT (48)
+const byte PROGMEM speaking_frames[][288] = {
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,3,8,32,4,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,131,8,97,134,16,193,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,32,4,16,192,2,8,0,0,16,64,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,64,0,8,32,0,16,192,2,8,96,0,16,192,3,8,96,4,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,193,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,6,16,193,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,4,16,192,2,8,96,0,16,192,0,8,32,0,16,192,0,8,0,0,16,64,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,0,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,64,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,2,8,96,0,16,192,3,8,96,6,16,192,3,8,96,6,16,192,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,6,16,192,3,8,96,6,16,192,2,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,0,0,16,64,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,0,8,32,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,3,8,96,0,16,192,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,32,0,16,192,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,96,0,0,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,195,195,8,97,132,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,132,16,195,0,8,96,0,16,195,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,0,96,0,0,192,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,64,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,8,96,0,0,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,195,192,8,97,128,16,195,192,8,97,128,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,192,8,97,128,16,195,192,8,97,128,16,195,0,8,96,0,16,195,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,16,192,0,8,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,0,0,0,64,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,64,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,8,96,0,0,192,0,8,96,0,16,192,0,8,96,0,16,193,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,194,8,97,128,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,194,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,0,8,96,0,16,193,0,8,96,0,16,192,0,8,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,32,0,0,64,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,128,8,96,0,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,194,8,97,132,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,194,8,97,132,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,0,8,96,0,0,195,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,64,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,193,192,0,97,128,0,195,192,8,97,128,0,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,0,195,192,0,97,128,0,195,0,0,96,0,0,193,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,32,0,0,64,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,0,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,8,97,128,0,195,192,8,97,128,16,195,192,8,97,128,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,192,8,97,128,16,195,192,8,97,128,16,195,192,8,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,0,0,96,0,0,195,0,0,96,0,0,192,0,0,96,0,0,192,0,0,96,0,0,192,0,0,32,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,96,0,0,192,128,0,96,0,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,8,97,128,0,195,194,8,97,132,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,194,8,97,132,16,195,192,8,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,128,0,96,0,0,195,0,0,96,0,0,192,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,192,0,97,128,0,67,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,67,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,97,128,0,3,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,0,97,134,0,195,195,0,97,134,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,97,128,0,195,192,0,33,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,33,128,0,3,192,0,97,128,0,67,192,0,97,128,0,195,194,0,97,132,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,8,97,134,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,194,0,97,132,0,195,192,0,97,128,0,195,192,0,97,128,0,67,192,0,33,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,194,0,97,132,0,67,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,192,0,97,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,194,0,1,132,0,3,195,0,33,134,0,3,195,0,97,134,0,67,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,97,134,0,67,195,0,33,134,0,3,194,0,1,132,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,33,134,0,3,195,0,97,134,0,195,195,0,97,134,0,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,0,97,134,0,195,195,0,97,134,0,195,195,0,33,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,192,0,1,128,0,3,194,0,1,132,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,97,134,0,67,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,0,33,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,194,0,1,132,0,3,192,0,1,128,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,6,0,0,131,0,0,6,0,1,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,8,97,134,16,67,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,67,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,131,0,0,6,0,1,3,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,1,134,16,3,195,8,1,134,16,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,195,0,1,134,0,3,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,4,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,195,0,1,134,0,3,195,0,1,134,0,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,33,134,16,67,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,33,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,0,1,134,0,3,195,0,1,134,0,3,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,2,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,131,8,0,6,16,1,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,33,134,16,67,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,33,134,16,67,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,4,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,8,0,6,16,0,3,8,0,6,16,0,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,67,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,1,134,16,67,195,8,1,134,16,3,195,8,1,134,16,3,195,8,1,134,16,3,3,8,0,6,16,0,3,8,0,6,16,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,2,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,195,8,1,134,16,3,195,8,1,134,16,3,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,1,134,16,3,195,8,1,134,16,3,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,3,0,0,6,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,6,0,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,195,8,33,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,33,134,16,195,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,3,8,0,4,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,192,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,0,6,16,192,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,4,16,0,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,2,8,0,0,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,64,3,8,96,6,16,192,3,8,96,6,16,192,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,6,16,192,3,8,96,6,16,192,3,8,0,6,16,64,3,8,0,6,16,0,3,8,0,6,16,0,3,8,0,6,16,0,2,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,2,8,0,0,16,0,3,8,0,4,16,0,3,8,0,6,16,64,3,8,32,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,195,8,97,134,16,195,3,8,96,6,16,192,3,8,96,6,16,192,3,8,96,6,16,192,3,8,32,6,16,192,3,8,0,6,16,64,3,8,0,4,16,0,2,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,8,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+};
+
+#define SPEAKING_FRAME_COUNT (sizeof(speaking_frames) / sizeof(speaking_frames[0]))
+#define SAMPLE_RATE 8000
+#define RECORDING_SECONDS 10
+const int audio_buffer_size = SAMPLE_RATE * RECORDING_SECONDS * sizeof(int16_t);
+int16_t* audio_buffer = NULL;
+
+const char* openai_host = "api.openai.com";
+const char* whisper_endpoint = "https://api.openai.com/v1/audio/transcriptions";
+const char* chatgpt_endpoint = "https://api.openai.com/v1/chat/completions";
+const char* weather_host = "api.openweathermap.org";
+const char* weather_endpoint = "/data/2.5/weather";
+
+I2SClass I2S;
+Audio audio;
+
+// ========== STATE MACHINES & ENUMERATIONS ==========
+enum State { S_IDLE, S_RECORDING, S_TRANSCRIBING };
+State currentState = S_IDLE;
+enum AIState { AI_IDLE, AI_LISTENING, AI_THINKING, AI_SPEAKING, AI_ALARMING, AI_SURVEILLANCE };
+AIState currentAIState = AI_IDLE;
+
+// ========== UI & STATE SYNCHRONIZATION ==========
+unsigned long lastStateSync = 0;
+AIState lastSyncedState = (AIState)-1;
+unsigned long lastAlarmSync = 0;
+
+enum IdleDisplayState { IDLE_EYES, IDLE_INFO }; 
+IdleDisplayState currentIdleDisplay = IDLE_EYES;
+unsigned long lastIdleSwitchTime = 0;
+const unsigned long IDLE_DISPLAY_DURATION_MS = 5000; 
+
+int leftEyeX = 36;
+int rightEyeX = 92;
+int eyeY = 32;
+int eyeWidth = 40;
+int eyeHeight = 35;
+int pupilRadius = 10;
+float pupilX = 0, pupilY = 0, targetPupilX = 0, targetPupilY = 0;
+float browOffsetLeft = 0, browOffsetRight = 0, targetBrowOffset = 0;
+unsigned long lastMoveTime = 0;
+bool isBlinking = false;
+unsigned long blinkStart = 0;
+unsigned long lastBlink = 0;
+int speaking_frame_index = 0;
+unsigned long last_speaking_frame_time = 0;
+int currentTouchValue = 0;
+bool introSpoken = false; 
+bool showNetworkInfo = false;  
+unsigned long networkInfoStartTime = 0;  
+
+void updateAnimation();
+void drawEye(int centerX, int centerY, int w, int h, float px, float py);
+void drawBlink(int centerX, int centerY, int w);
+void drawEyebrow(int centerX, int browY, int w, float offset);
+String handleTimeDateRequest();                     
+String handleWeatherRequest(String city);           
+String handleGoogleSearch(String query);
+void showLoadingScreen(String status);
+void addToHistory(String role, String content, String tool_call_id = "");
+void broadcastState(AIState state);
+void createWavHeader(byte* header, int wavDataSize);
+void speakText(String text);
+void speakDefaultIntroduction();
+void playAlarmTone();
+int recordAudio();
+void initCamera();
+void handleVisionRequest();
+GptResponse chatWithGpt(String vision_prompt = "", String image = ""); 
+int recordAudio();                      
+String transcribeWithWhisper(int audio_len, int16_t* audio_data = NULL);
+void processAudio(int bytes_recorded, int samples_recorded); 
+
+String handleGoogleSearch(String query) {
+    // Query Google Custom Search API and return snippet of first result
+    // Used for: "Hey Kiko, what is...?" or "Tell me about..."
+    Serial.println("Handling Google Search request for: " + query);
+    query.replace(" ", "%20");
+    String url = "https://www.googleapis.com/customsearch/v1";
+    url += "?key=" + String(GOOGLE_SEARCH_API_KEY);
+    url += "&cx=" + String(GOOGLE_SEARCH_CX);
+    url += "&q=" + query;
+    url += "&num=1"; 
+    
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        Serial.println("Failed to begin HTTP for Google Search");
+        return "Hmm, I had trouble setting that up. Let me try again in a moment.";
+    }
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        JsonDocument doc;
+        deserializeJson(doc, payload);
+        
+        if (doc.containsKey("items") && doc["items"].size() > 0) {
+            String snippet = doc["items"][0]["snippet"];
+            snippet.trim();
+            Serial.println("Google snippet: " + snippet);
+            return snippet; 
+        } else {
+            Serial.println("No search results found.");
+            return "I couldn't find anything on that. Maybe try rephrasing your question?";
+        }
+    } else {
+        Serial.printf("[HTTP] Google Search failed, error: %s\n", http.errorToString(httpCode).c_str());
+        return "I'm having trouble connecting to the search service right now. Want to try again?";
+    }
+    http.end();
+}
+
+
+
+
+
+
+
+
+String stateToString() {
+  switch(currentAIState) {
+    case AI_IDLE: return "Idle";
+    case AI_LISTENING: return "Listening";
+    case AI_THINKING: return "Thinking";
+    case AI_SPEAKING: return "Speaking";
+    case AI_ALARMING: return "Alarming";
+    case AI_SURVEILLANCE: return "Surveillance";
+    default: return "Unknown";
+  }
+}
+void saveChatHistory() {
+  File file = SPIFFS.open("/chat_history.json", FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open chat history file for writing");
+    return;
+  }
+  
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.createNestedArray("history");
+  for (const auto& msg : chatHistory) {
+    JsonObject msgObj = arr.createNestedObject();
+    msgObj["role"] = msg.role;
+    msgObj["content"] = msg.content;
+  }
+  
+  serializeJson(doc, file);
+  file.close();
+  Serial.println("Chat history saved: " + String(chatHistory.size()) + " messages");
+}
+
+void loadChatHistory() {
+  if (!SPIFFS.exists("/chat_history.json")) {
+    Serial.println("Chat history file not found");
+    return;
+  }
+  
+  File file = SPIFFS.open("/chat_history.json", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open chat history file for reading");
+    return;
+  }
+  
+  DynamicJsonDocument doc(8192);
+  deserializeJson(doc, file);
+  
+  chatHistory.clear();
+  JsonArray arr = doc["history"];
+  for (JsonObject msgObj : arr) {
+    String role = msgObj["role"].as<String>();
+    String content = msgObj["content"].as<String>();
+    chatHistory.push_back({role, content, ""});
+  }
+  
+  file.close();
+  Serial.println("Chat history loaded: " + String(chatHistory.size()) + " messages");
+}
+
+void saveTodoLists() {
+  File file = SPIFFS.open("/todo_lists.json", FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open todo lists file for writing");
+    return;
+  }
+  
+  JsonDocument doc;
+  JsonObject listsObj = doc.createNestedObject("lists");
+  
+  for (auto const& [listName, items] : todoLists) {
+    JsonObject listItems = listsObj.createNestedObject(listName);
+    for (auto const& [item, qty] : items) {
+      listItems[item] = qty;
+    }
+  }
+  
+  serializeJson(doc, file);
+  file.close();
+  Serial.println("Todo lists saved");
+}
+
+void loadTodoLists() {
+  if (!SPIFFS.exists("/todo_lists.json")) {
+    Serial.println("Todo lists file not found");
+    return;
+  }
+  
+  File file = SPIFFS.open("/todo_lists.json", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open todo lists file for reading");
+    return;
+  }
+  
+  JsonDocument doc;
+  deserializeJson(doc, file);
+  
+  todoLists.clear();
+  JsonObject listsObj = doc["lists"];
+  for (JsonPair p : listsObj) {
+    String listName = p.key().c_str();
+    JsonObject items = p.value().as<JsonObject>();
+    for (JsonPair item : items) {
+      todoLists[listName][item.key().c_str()] = item.value().as<int>();
+    }
+  }
+  
+  file.close();
+  Serial.println("Todo lists loaded");
+}
+
+void clearChatHistory() {
+  chatHistory.clear();
+  transactionHistory.clear();
+  if (SPIFFS.exists("/chat_history.json")) {
+    SPIFFS.remove("/chat_history.json");
+  }
+  saveChatHistory();
+  Serial.println("Chat history cleared");
+}
+
+void clearTodoLists() {
+  todoLists.clear();
+  if (SPIFFS.exists("/todo_lists.json")) {
+    SPIFFS.remove("/todo_lists.json");
+  }
+  saveTodoLists();
+  Serial.println("Todo lists cleared");
+}
+
+void handleImage() {
+  if (lastCapturedImage.empty()) {
+    server.send(404, "text/plain", "No image captured yet.");
+    return;
+  }
+  
+  // Add cache-busting headers to force fresh image
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  // Add ETag based on counter to invalidate cache on new image
+  server.sendHeader("ETag", "\"" + String(imageCaptureCounter) + "\"");
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.send_P(200, "image/jpeg", (const char*)lastCapturedImage.data(), lastCapturedImage.size());
+}
+
+void setLedState(AIState state) {
+    switch (state) {
+        case AI_LISTENING:
+            digitalWrite(RGB_RED_PIN, LOW);
+            digitalWrite(RGB_GREEN_PIN, HIGH);
+            digitalWrite(RGB_BLUE_PIN, LOW);
+            break;
+        case AI_THINKING:
+            digitalWrite(RGB_RED_PIN, LOW);
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            digitalWrite(RGB_BLUE_PIN, HIGH);
+            break;
+        case AI_SPEAKING:
+            digitalWrite(RGB_RED_PIN, HIGH);
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            digitalWrite(RGB_BLUE_PIN, LOW);
+            break;
+        case AI_ALARMING: // --- NEW ---
+            // Flash Red
+            digitalWrite(RGB_RED_PIN, (millis() % 500 < 250) ? LOW : HIGH);
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            digitalWrite(RGB_BLUE_PIN, LOW);
+            break;
+        case AI_IDLE:
+        default:
+            digitalWrite(RGB_RED_PIN, HIGH);
+            digitalWrite(RGB_GREEN_PIN, HIGH);
+            digitalWrite(RGB_BLUE_PIN, HIGH);
+            break;
+    }
+}
+
+void broadcastChatHistory();
+void broadcastGallery();
+
+void addToHistory(String role, String content, String tool_call_id) {
+    if (chatHistory.size() >= MAX_HISTORY_MESSAGES) {
+        chatHistory.erase(chatHistory.begin());
+    }
+    chatHistory.push_back({role, content, tool_call_id});
+
+    
+    
+    if (role == "user") {
+        if (transactionHistory.size() >= MAX_HISTORY_SIZE) {
+             transactionHistory.erase(transactionHistory.begin());
+        }
+        transactionHistory.push_back("You: " + content);
+        broadcastChatHistory();  // Broadcast chat update
+    } else if (role == "assistant" && content.length() > 0) {
+         if (transactionHistory.size() >= MAX_HISTORY_SIZE) {
+             transactionHistory.erase(transactionHistory.begin());
+        }
+        transactionHistory.push_back("AI: " + content);
+        broadcastChatHistory();  // Broadcast chat update
+    }
+}
+
+// Function declarations
+void handleRoot();
+void handleStateAPI();
+void handleTasksData();
+void handleClearChat();
+void handleClearGallery();
+void handleClearTodos();
+void handleCancelAlarm();
+void handleImage();
+void handleFile();
+String getContentType(const String& filename);
+
+// Broadcast state changes to web clients
+void broadcastState(AIState state);
+void broadcastTranscription(String text);
+void broadcastAlarm(unsigned long triggerTime, bool active);
+void broadcastTodoLists();
+void broadcastCameraMode(String mode);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void sendToAllClients(String json);
+
+// Broadcast state to WebSocket clients
+void broadcastState(AIState state) {
+  // Rate-limit updates to 500ms intervals
+  if (lastSyncedState == state && (millis() - lastStateSync) < 500) return;
+  lastSyncedState = state;
+  lastStateSync = millis();
+  
+  String stateStr = "";
+  switch(state) {
+    case AI_IDLE: stateStr = "Idle"; break;
+    case AI_LISTENING: stateStr = "Listening"; break;
+    case AI_THINKING: stateStr = "Processing"; break;
+    case AI_SPEAKING: stateStr = "Speaking"; break;
+    case AI_ALARMING: stateStr = "Alarming"; break;
+    case AI_SURVEILLANCE: stateStr = "Surveillance"; break;
+  }
+  
+  StaticJsonDocument<64> doc;
+  doc["state"] = stateStr;
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastTranscription(String text) {
+  StaticJsonDocument<256> doc;
+  doc["transcript"] = text;
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastAlarm(unsigned long triggerTime, bool active) {
+  // Rate-limit to 200ms intervals
+  if ((millis() - lastAlarmSync) < 200) return;
+  lastAlarmSync = millis();
+  
+  StaticJsonDocument<128> doc;
+  if (active && triggerTime > 0) {
+    unsigned long remaining = (triggerTime > millis()) ? (triggerTime - millis()) : 0;
+    time_t currentUnixTime = time(nullptr);
+    
+    // Only send if time is synced (for valid timestamps)
+    if (currentUnixTime > 1700000000) {
+      unsigned long alarmUnixTime = (currentUnixTime * 1000) + remaining;
+      doc["alarm"] = true;
+      doc["alarm_time"] = alarmUnixTime;
+      doc["remaining"] = remaining / 1000;
+      doc["is_ringing"] = (currentAIState == AI_ALARMING);
+    } else {
+      doc["alarm"] = false;
+      return;
+    }
+  } else {
+    doc["alarm"] = false;
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastTodoLists() {
+  DynamicJsonDocument doc(512);
+  JsonObject lists = doc.createNestedObject("lists");
+  
+  for (auto const& [listName, items] : todoLists) {
+    JsonObject list = lists.createNestedObject(listName);
+    for (auto const& [item, qty] : items) {
+      list[item] = qty;
+    }
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastCameraMode(String mode) {
+  StaticJsonDocument<64> doc;
+  doc["camera_mode"] = mode;
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastChatHistory() {
+  DynamicJsonDocument doc(4096);
+  JsonArray history = doc.createNestedArray("history");
+  
+  for (const auto& msg : chatHistory) {
+    JsonObject msgObj = history.createNestedObject();
+    msgObj["role"] = msg.role;
+    msgObj["content"] = msg.content;
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void broadcastGallery() {
+  DynamicJsonDocument doc(512);
+  JsonArray gallery = doc.createNestedArray("gallery");
+  
+  if (!lastCapturedImage.empty()) {
+    JsonObject imgObj = gallery.createNestedObject();
+    imgObj["url"] = "/last_image.jpg";
+    imgObj["timestamp"] = imageCaptureCounter;
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  sendToAllClients(json);
+}
+
+void sendToAllClients(String json) {
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+    if (webSocket.sendTXT(i, json)) {
+      // Message sent
+    }
+  }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected\n", num);
+      break;
+      
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      // Send current state snapshot to new client
+      broadcastState(currentAIState);
+      broadcastAlarm(alarmTriggerTime, alarmTriggerTime != 0);
+      broadcastTodoLists();
+      broadcastChatHistory();
+      broadcastGallery();
+      break;
+    }
+    
+    case WStype_TEXT: {
+      Serial.printf("[%u] Received: %s\n", num, payload);
+      
+      // Parse JSON command
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      
+      if (!error) {
+        String type = doc["type"] | "";
+        String action = doc["action"] | "";
+        
+        if (type == "stop_surveillance") {
+          Serial.println("WebSocket: Stop surveillance command received");
+          inSurveillanceMode = false;
+          currentAIState = AI_IDLE;
+          cameraInUse = false;
+          broadcastState(AI_IDLE);
+          broadcastCameraMode("off");
+          Serial.println(">>> Surveillance stopped via web interface");
+        }
+        
+        // Handle clear actions from web interface
+        if (action == "clear_chat") {
+          Serial.println("WebSocket: Clear chat history requested");
+          clearChatHistory();
+          broadcastChatHistory();
+        }
+        
+        if (action == "clear_gallery") {
+          Serial.println("WebSocket: Clear gallery requested");
+          lastCapturedImage.clear();
+          if (SPIFFS.exists("/last_image.jpg")) {
+            SPIFFS.remove("/last_image.jpg");
+          }
+          broadcastGallery();
+        }
+        
+        if (action == "clear_todos") {
+          Serial.println("WebSocket: Clear todos requested");
+          clearTodoLists();
+          broadcastTodoLists();
+        }
+      }
+      break;
+    }
+  }
+}
+
+// Task for handling MJPEG stream on separate core (prevents main loop blocking)
+void streamTask(void *param) {
+    Serial.println("Stream: Task started on separate core");
+    
+    WiFiClient client = server.client();
+    if (!client.connected()) {
+        Serial.println("Stream: Client not connected");
+        streamTaskRunning = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    String response = "HTTP/1.1 200 OK\r\n";
+    response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
+    response += "Cache-Control: no-cache\r\n";
+    response += "Connection: keep-alive\r\n\r\n";
+    
+    client.print(response);
+    client.flush();
+    
+    int frameCount = 0;
+    unsigned long streamStartTime = millis();
+    unsigned long lastFrameSendTime = 0;
+    
+    while (client.connected() && inSurveillanceMode) {
+        // 1. Give the main loop time to run (Fixes touch sensor freeze)
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+        
+        // 2. Pause stream if Kiko is speaking or listening to save PSRAM bandwidth
+        if (cameraInUse || currentAIState == AI_LISTENING || currentAIState == AI_SPEAKING) {
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
+        // Timeout after 2 hours
+        if (millis() - streamStartTime > 7200000) {
+            Serial.println("Stream: 2-hour timeout reached");
+            break;
+        }
+        
+        // Get frame
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
+        // Send MJPEG frame
+        client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+        size_t sent = client.write(fb->buf, fb->len);
+        client.print("\r\n");
+        
+        esp_camera_fb_return(fb);
+        frameCount++;
+        
+        if (frameCount % 30 == 0) {
+            Serial.printf("Stream: Sent %d frames\n", frameCount);
+        }
+    }
+    
+    Serial.printf("Stream: Task ended. Total frames: %d\n", frameCount);
+    client.stop();
+    streamTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+void handleStream() {
+    // CRITICAL: Only allow streaming if surveillance mode is ACTIVE
+    if (!inSurveillanceMode) {
+        server.send(403, "text/plain", "Surveillance mode not active");
+        Serial.println("Stream: Rejected - surveillance not active");
+        return;
+    }
+    
+    // Stop previous task if still running
+    if (streamTaskRunning && streamTaskHandle != nullptr) {
+        vTaskDelete(streamTaskHandle);
+        streamTaskHandle = nullptr;
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    streamTaskRunning = true;
+    Serial.println("Stream: Creating task on Core 1");
+    
+    // Create task on Core 1 (prevents WiFi interference from Core 0)
+    // Core 0 handles WiFi/network stack, Core 1 runs main app
+    xTaskCreatePinnedToCore(
+        streamTask,           // Task function
+        "StreamTask",         // Task name
+        8192,                 // Stack size (bytes) - reduced to save RAM
+        NULL,                 // Parameter
+        1,                    // Priority (1 = lower than main loop)
+        &streamTaskHandle,    // Task handle
+        1                     // Core 1 (prevents WiFi packet interference)
+    );
+    
+    // Don't send anything - let the task handle the client
+}
+
+// ========== INITIALIZATION (SETUP) ==========
+// Hardware init: Serial, I2C, SPIFFS, WiFi, OTA, HTTP/WebSocket servers, Camera, Audio, OLED, Timers
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+
+    // Initialize SPIFFS for persistent data storage
+    if(!SPIFFS.begin(true)) {
+        Serial.println("SPIFFS Mount Failed");
+    } else {
+        Serial.println("SPIFFS Mount Successful");
+        loadTodoLists();
+    }
+
+    // Initialize OLED display
+    u8g2.begin();
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+    u8g2.setFontMode(1);
+
+    currentAIState = AI_IDLE;
+    introSpoken = false;
+
+    pinMode(RGB_RED_PIN, OUTPUT);
+    pinMode(RGB_GREEN_PIN, OUTPUT);
+    pinMode(RGB_BLUE_PIN, OUTPUT);
+    setLedState(AI_IDLE);
+
+    audio_buffer = (int16_t*) ps_malloc(audio_buffer_size);
+    if (!audio_buffer) {
+        Serial.println("FATAL: Failed to allocate audio buffer memory!");
+        while(1);
+    }
+
+    // Connect to WiFi with optimizations
+    Serial.println("\n===== WiFi CONNECTION =====");
+    Serial.print("Connecting to WiFi SSID: ");
+    Serial.println(WIFI_SSID);
+    
+    showLoadingScreen("WiFi...");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int wifi_timeout = 0;
+    Serial.print("  Connecting: ");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+        showLoadingScreen("WiFi...");
+        wifi_timeout++;
+        
+        if (wifi_timeout > 200) {
+            Serial.println("\nWiFi connection failed after 60 seconds. Check your credentials.");
+            Serial.printf("  Last WiFi Status: %d\n", WiFi.status());
+            Serial.println("  Retrying with explicit disconnect...");
+            WiFi.disconnect();
+            delay(1000);
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            wifi_timeout = 0;
+            
+            // Second attempt timeout (another 30 seconds)
+            while (WiFi.status() != WL_CONNECTED && wifi_timeout < 100) {
+                delay(300);
+                Serial.print(".");
+                wifi_timeout++;
+            }
+            
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("\nWiFi connection FAILED after retry. Continuing without WiFi.");
+                Serial.println("⚠️  Features requiring WiFi will not work.");
+                break;
+            }
+        }
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n✓ WiFi connected!");
+        Serial.printf("  SSID: %s\n", WiFi.SSID().c_str());
+        Serial.print("  IP Address: ");
+        Serial.println(WiFi.localIP());
+        Serial.printf("  Signal Strength: %d dBm\n", WiFi.RSSI());
+    }
+    Serial.println("===========================\n");
+
+    // Display IP address on OLED screen briefly
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(0, 15, "WiFi Connected");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    String ipStr = "IP: " + WiFi.localIP().toString();
+    u8g2.drawStr(0, 35, ipStr.c_str());
+    u8g2.sendBuffer();
+    delay(5000);
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+
+    // Configure OTA firmware updates
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA
+        .onStart([]() {
+            String type;
+            if (ArduinoOTA.getCommand() == U_FLASH)
+                type = "sketch";
+            else // U_SPIFFS
+                type = "filesystem";
+            Serial.println("Start updating " + type);
+            // Display OTA status on OLED
+            u8g2.clearBuffer();
+            u8g2.setFont(u8g2_font_ncenB10_tr);
+            u8g2.drawStr(20, 35, "OTA Update...");
+            u8g2.sendBuffer();
+        })
+        .onEnd([]() {
+            Serial.println("\nEnd");
+            // --- SUCCESS LED INDICATION ---
+            digitalWrite(RGB_RED_PIN, LOW);   // ALL OFF
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            digitalWrite(RGB_BLUE_PIN, LOW);
+            delay(100);
+            digitalWrite(RGB_GREEN_PIN, HIGH);  // Flash Green ✅
+            delay(500);
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            // --- END LED INDICATION ---
+            u8g2.clearBuffer();
+            u8g2.setFont(u8g2_font_ncenB10_tr);
+            u8g2.drawStr(20, 35, "Update OK!");
+            u8g2.sendBuffer();
+            delay(1000);
+        })
+        .onProgress([](unsigned int progress, unsigned int total) {
+            Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+            // --- CYCLING LED INDICATION ---
+            unsigned long now = millis();
+            int cycle = (now / 1000) % 3; // 0=R, 1=G, 2=B
+            digitalWrite(RGB_RED_PIN,   (cycle == 0) ? LOW : HIGH);
+            digitalWrite(RGB_GREEN_PIN, (cycle == 1) ? LOW : HIGH);
+            digitalWrite(RGB_BLUE_PIN,  (cycle == 2) ? LOW : HIGH);
+            // --- END LED INDICATION ---
+            // Update OLED progress bar
+            u8g2.drawFrame(10, 50, 108, 10);
+            u8g2.drawBox(12, 52, (104 * progress) / total, 6);
+            u8g2.sendBuffer();
+        })
+        .onError([](ota_error_t error) {
+            Serial.printf("Error[%u]: ", error);
+            if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+            else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+            else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+            else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+            else if (error == OTA_END_ERROR) Serial.println("End Failed");
+            // --- ERROR LED INDICATION ---
+            digitalWrite(RGB_RED_PIN, LOW);   // ALL OFF
+            digitalWrite(RGB_GREEN_PIN, LOW);
+            digitalWrite(RGB_BLUE_PIN, LOW);
+            delay(100);
+            digitalWrite(RGB_RED_PIN, HIGH);   // Flash Red ❌ twice
+            delay(500);
+            digitalWrite(RGB_RED_PIN, LOW);
+            delay(100);
+            digitalWrite(RGB_RED_PIN, HIGH);
+            delay(500);
+            digitalWrite(RGB_RED_PIN, LOW);
+            // --- END LED INDICATION ---
+            u8g2.clearBuffer();
+            u8g2.setFont(u8g2_font_ncenB10_tr);
+            u8g2.drawStr(20, 35, "OTA Error!");
+            u8g2.sendBuffer();
+            delay(2000);
+        });
+
+    ArduinoOTA.begin(); // Start the OTA service
+    Serial.println("OTA Initialized");
+    // --- End of OTA code ---
+
+    // Configure NTP time synchronization (using IST offset)
+    Serial.println("\n===== NTP TIME SYNCHRONIZATION =====");
+    Serial.println("Synchronizing time with NTP server...");
+    Serial.printf("  WiFi Status: %d (1=WL_CONNECTED, 3=WL_CONNECTED)\n", WiFi.status());
+    Serial.printf("  WiFi RSSI: %d dBm\n", WiFi.RSSI());
+    
+    showLoadingScreen("Time Sync...");
+    
+    // Try multiple NTP servers - use well-known public NTP server IPs
+    // These are primary pool.ntp.org servers with high reliability
+    Serial.println("  Configuring NTP with automatic server discovery...");
+    Serial.println("  Using: pool.ntp.org (global), time.nist.gov, time.google.com");
+    
+    // Let the system find NTP servers automatically using well-known pools
+    // pool.ntp.org rotates across thousands of servers worldwide
+    configTime(5 * 3600 + 30 * 60, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    
+    // Wait for time to be synchronized with aggressive timeout
+    time_t now = time(nullptr);
+    int time_sync_timeout = 0;
+    bool time_synced = false;
+    
+    Serial.print("  Waiting for NTP sync (max 10 sec): ");
+    
+    // Fast initial check - only 10 seconds instead of 20
+    while (now < 24 * 3600 && time_sync_timeout < 20) {  // 20 iterations × 500ms = 10 seconds
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+        time_sync_timeout++;
+        
+        // If time synced, break early
+        if (now > 24 * 3600) {
+            time_synced = true;
+            break;
+        }
+    }
+    
+    if (now > 24 * 3600) {
+        Serial.println("\n✓ Time synchronized successfully!");
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char buffer[80];
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S IST", &timeinfo);
+        Serial.printf("  Current time: %s\n", buffer);
+    } else {
+        Serial.println("\n⚠ Time sync timeout - Kiko will start. Sync happening in background...");
+        Serial.printf("  Current system time (epoch): %ld\n", now);
+        Serial.println("  NOTE: Speech will become available once time syncs!");
+        Serial.println("  LIKELY CAUSE: UDP Port 123 (NTP) blocked by firewall");
+    }
+    Serial.println("=====================================\n");
+
+    // Initialize I2S microphone input
+    showLoadingScreen("Microphone...");
+    I2S.setPinsPdmRx(I2S_PDM_CLK_PIN, I2S_PDM_DATA_PIN);
+    bool micInitSuccess = false;
+    for (int mic_retry = 0; mic_retry < 3; mic_retry++) {
+        if (I2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+            micInitSuccess = true;
+            Serial.println("✓ I2S microphone initialized.");
+            break;
+        } else {
+            Serial.printf("⚠ Microphone init attempt %d/3 failed, retrying...\n", mic_retry + 1);
+            delay(500);
+        }
+    }
+    
+    if (!micInitSuccess) {
+        Serial.println("❌ Failed to initialize I2S microphone after 3 attempts!");
+        Serial.println("⚠️  Kiko will continue without microphone. Voice input will not work.");
+    }
+    showLoadingScreen("Microphone OK");
+
+    // Initialize I2S audio output
+    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    audio.setVolume(21); // Set default volume (0-10)
+
+    showLoadingScreen("Camera...");
+    delay(2000); 
+    initCamera(); // Initialize camera
+    Serial.println("✅ Camera Hardware Initialized");
+    // Setup web server routes (SPIFFS-backed)
+    // Root and static assets are served from SPIFFS via handleFile() or server.serveStatic
+    server.on("/", handleFile);          // Root serves /index.html from SPIFFS
+    server.on("/index.html", handleFile);
+    server.on("/style.css", handleFile);
+    server.on("/app.js", handleFile);
+    server.on("/favicon.ico", handleFile);
+
+    server.on("/api/state", handleStateAPI); // Handle API requests for state updates
+    server.on("/tasks_data", handleTasksData); // Handle tasks tab data updates (serves small fragment)
+    server.on("/clear_chat", handleClearChat); // Handle clear chat history
+    server.on("/clear_gallery", handleClearGallery); // Handle clear gallery
+    server.on("/clear_todos", handleClearTodos); // Handle clear todo lists
+    server.on("/api/alarm/cancel", HTTP_POST, handleCancelAlarm);
+    server.on("/rtttl/alarm", handleRtttlAlarm);
+    server.on("/last_image.jpg", handleImage);
+    server.on("/stream", handleStream);  // Live MJPEG stream for surveillance
+
+    server.onNotFound(handleFile); // Catch-all: attempt to serve requested path from SPIFFS
+
+    server.begin();                      // Start the web server
+    Serial.println("Web server started (SPIFFS-backed).");
+    
+    // --- INITIALIZE WEBSOCKET SERVER ---
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+    Serial.println("WebSocket server started on port 81.");
+
+    Serial.println("\n===== Kiko Voice Assistant Initializing =====");
+
+    Serial.println("\n===== Kiko Voice Assistant Initialized =====");
+
+    // Display "Ready" screen
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(35, 30, "KIKO");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(35, 50, "Ready!");
+    u8g2.sendBuffer();
+    delay(2000);
+
+    // Set initial state and inactivity timer
+    currentAIState = AI_IDLE;
+
+    // Wait for NTP time sync before speaking - critical for TTS
+    Serial.println("Waiting for NTP time sync before introduction...");
+    int ntp_wait = 0;
+    time_t currentTime = time(nullptr);
+    while (currentTime < 24 * 3600 && ntp_wait < 30) {  // Wait up to 15 seconds
+        // Keep systems responsive during NTP wait
+        ArduinoOTA.handle();  // Handle OTA if initiated
+        delay(500);
+        currentTime = time(nullptr);
+        ntp_wait++;
+        if (ntp_wait % 4 == 0) Serial.print(".");
+    }
+    if (currentTime >= 24 * 3600) {
+        Serial.println("\n✓ NTP synced! Time is valid.");
+    } else {
+        Serial.println("\n⚠️  NTP sync timeout - may affect TTS");
+    }
+    delay(1000);  // Additional buffer to ensure all systems are ready
+
+    // Flag to speak introduction in main loop (not here in setup)
+    introSpoken = false;
+}
+
+// ========== AUDIO PROCESSING PIPELINE ==========
+// Recording -> Transcription -> GPT processing -> Response
+
+void processAudio(int bytes_recorded, int samples_recorded) {
+    currentAIState = AI_THINKING;
+    broadcastState(AI_THINKING); // --- SYNC TO UI ---
+    updateAnimation();
+    if (samples_recorded > 1000) {
+        String transcribedText = transcribeWithWhisper(bytes_recorded);
+        
+        if (transcribedText.length() == 0 || transcribedText.equalsIgnoreCase("you")) {
+             Serial.println("❌ Transcription was empty or garbled. Skipping.");
+             currentState = S_IDLE;
+             currentAIState = AI_IDLE;
+        broadcastState(AI_IDLE); // --- SYNC TO UI ---
+             return; 
+        }
+
+        Serial.print("🗣️ You said: "); Serial.println(transcribedText);
+        broadcastTranscription(transcribedText);
+        String lowerCaseText = transcribedText;
+        lowerCaseText.toLowerCase();
+        
+        // Check for vision requests (describe what I see)
+        if (lowerCaseText.indexOf("what do you see") != -1 || lowerCaseText.indexOf("describe") != -1) {
+            Serial.println("Vision request detected");
+            handleVisionRequest(); 
+            currentState = S_IDLE;
+            currentAIState = AI_IDLE;
+            broadcastState(AI_IDLE); // --- SYNC TO UI ---
+            return; 
+        }
+        
+        // Check for story requests - try Wikipedia > OpenAI (Gutendex commented out)
+        if (lowerCaseText.indexOf("tell me") != -1 && lowerCaseText.indexOf("story") != -1) {
+            Serial.println("Story request detected - trying Wikipedia then OpenAI");
+            currentAIState = AI_THINKING;
+            broadcastState(AI_THINKING);
+            
+            String storyQuery = transcribedText;
+            int storyIdx = lowerCaseText.indexOf("story");
+            if (storyIdx != -1 && storyIdx + 5 < storyQuery.length()) {
+                storyQuery = storyQuery.substring(storyIdx + 5);
+                storyQuery.trim();
+                if (storyQuery.startsWith("of ")) {
+                    storyQuery = storyQuery.substring(3);
+                    storyQuery.trim();
+                }
+                if (storyQuery.startsWith("about ")) {
+                    storyQuery = storyQuery.substring(6);
+                    storyQuery.trim();
+                }
+            }
+            
+            // Story functionality removed
+            Serial.println("Story requests disabled");
+            String message = "Story functionality has been removed.";
+            speakText(message);
+            addToHistory("assistant", message);
+            
+            currentState = S_IDLE;
+            currentAIState = AI_IDLE;
+            broadcastState(AI_IDLE);
+            return;
+        }
+
+        // Inject current time context for better AI understanding
+        String promptForAI = transcribedText;
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            char buffer[100];
+            strftime(buffer, sizeof(buffer), "%I:%M %p on %A, %B %d, %Y", &timeinfo);
+            String timeStr = String(buffer);
+            if (timeStr.startsWith("0")) timeStr = timeStr.substring(1);
+            promptForAI = "It's " + timeStr + ". My request is: " + transcribedText;
+            Serial.println("Injecting context: " + timeStr);
+        }
+        addToHistory("user", promptForAI);
+
+        // Check if user is asking for introduction/greeting
+        String lowerText = transcribedText;
+        lowerText.toLowerCase();
+        bool isIntroRequest = (lowerText.indexOf("who are you") != -1 || 
+                               lowerText.indexOf("what is your name") != -1 ||
+                               lowerText.indexOf("introduce yourself") != -1 ||
+                               lowerText.indexOf("tell me about yourself") != -1 ||
+                               lowerText.indexOf("hello") != -1);
+        
+        // If asking for introduction, use stored intro instead of OpenAI
+        if (isIntroRequest) {
+            Serial.println("Introduction request detected - using stored introduction");
+            speakDefaultIntroduction();
+            currentState = S_IDLE;
+            currentAIState = AI_IDLE;
+            broadcastState(AI_IDLE); // --- SYNC TO UI ---
+            return;
+        }
+
+        GptResponse response1 = chatWithGpt();
+
+        // Process tool calls from ChatGPT response
+        if (!response1.toolCalls.empty()) { 
+            addToHistory("assistant", response1.rawAssistantMessage);
+            
+            bool allBypass = true;
+            String combinedToolResults = ""; 
+
+            // Execute each tool call
+            for (const auto& call : response1.toolCalls) {
+                String toolResult = "";
+                bool bypassAiCall2 = false; 
+
+                // Tool execution dispatcher
+                if (call.toolToCall == "get_weather") {
+                    isWeatherTask = true; 
+                    updateAnimation();
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    String city = argsDoc["city"].as<String>();
+                    toolResult = handleWeatherRequest(city);
+                    isWeatherTask = false;
+                    allBypass = false; 
+                } else if (call.toolToCall == "get_network_info") {
+                    // Provide device's local network information
+                    String ssid = WiFi.SSID();
+                    String ipAddr = WiFi.localIP().toString();
+                    long rssi = WiFi.RSSI();
+                    toolResult = "Your WiFi network is '" + ssid + "'. Your device's IP address is " + ipAddr + ". Signal strength is " + String(rssi) + " dBm.";
+                    showNetworkInfo = true;
+                    networkInfoStartTime = millis();
+                    allBypass = false;
+                } else if (call.toolToCall == "google_search") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    String query = argsDoc["query"].as<String>();
+                    toolResult = handleGoogleSearch(query);
+                    allBypass = false; 
+                } else if (call.toolToCall == "set_alarm_relative") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    int delay_seconds = argsDoc["delay_seconds"].as<int>();
+                    if (delay_seconds > 0) {
+                        alarmTriggerTime = millis() + (unsigned long)delay_seconds * 1000UL;
+                        alarmUpdateCounter++;
+                        broadcastAlarm(alarmTriggerTime, true); // --- SYNC TO UI ---
+                        currentAIState = AI_IDLE; 
+                        int minutes = delay_seconds / 60;
+                        int seconds = delay_seconds % 60;
+                        if (minutes > 0) {
+                            toolResult = "Got it! I'll wake you in " + String(minutes) + " minute" + (minutes > 1 ? "s" : "") + ".";
+                        } else {
+                            toolResult = "All set! Your alarm is ready in " + String(seconds) + " seconds.";
+                        }
+                    } else {
+                        toolResult = "That time doesn't look right. Could you try again?";
+                    }
+                    bypassAiCall2 = true;
+                } else if (call.toolToCall == "set_alarm_absolute") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    int targetHour = argsDoc["hour"].as<int>();
+                    int targetMinute = argsDoc["minute"].as<int>();
+                    String period = argsDoc["period"].as<String>();
+                    period.toUpperCase();
+                    struct tm timeinfo_alarm; 
+                    if (!getLocalTime(&timeinfo_alarm)) {
+                        toolResult = "I'm having trouble reading the time right now. Can you try setting the alarm again?";
+                    } else {
+                        int targetHour24 = targetHour;
+                        if (period == "PM" && targetHour != 12) { targetHour24 += 12; }
+                        if (period == "AM" && targetHour == 12) { targetHour24 = 0; }
+                        long targetTotalSeconds = targetHour24 * 3600 + targetMinute * 60;
+                        long currentTotalSeconds = timeinfo_alarm.tm_hour * 3600 + timeinfo_alarm.tm_min * 60 + timeinfo_alarm.tm_sec;
+                        long delay_seconds = targetTotalSeconds - currentTotalSeconds;
+                        if (delay_seconds < 10) { 
+                            delay_seconds += 86400; 
+                        }
+                        alarmTriggerTime = millis() + (unsigned long)delay_seconds * 1000UL;
+                        alarmUpdateCounter++;  // Increment counter for UI update
+                        currentAIState = AI_IDLE;
+                        String minuteStr = (targetMinute < 10) ? "0" + String(targetMinute) : String(targetMinute);
+                        toolResult = "Perfect! I'll alarm you at " + String(targetHour) + ":" + minuteStr + " " + period + ".";
+                    }
+                    bypassAiCall2 = true; 
+                } else if (call.toolToCall == "get_alarm_status") {
+                    if (currentAIState == AI_ALARMING) {
+                        toolResult = "Your alarm is going off right now!";
+                    } else if (alarmTriggerTime != 0) {
+                        unsigned long ms_remaining = alarmTriggerTime - millis();
+                        int seconds_remaining = ms_remaining / 1000UL;
+                        int minutes = seconds_remaining / 60;
+                        int seconds = seconds_remaining % 60;
+                        toolResult = "You've got an alarm coming up in about " + String(minutes) + " minute" + (minutes > 1 ? "s" : "") + " and " + String(seconds) + " seconds.";
+                    } else {
+                        toolResult = "You don't have any alarms set right now.";
+                    }
+                    allBypass = false;
+                } else if (call.toolToCall == "cancel_alarm") {
+                    if (alarmTriggerTime != 0) {
+                        alarmTriggerTime = 0; 
+                        toolResult = "Done! I've cancelled your alarm.";
+                    } else {
+                        toolResult = "No alarm to cancel right now.";
+                    }
+                    bypassAiCall2 = true; 
+                
+                // --- TODO HANDLERS ---
+                } else if (call.toolToCall == "add_todo_item") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    
+                    String listName = argsDoc["list_name"].as<String>();
+                    listName.toLowerCase();
+                    String item = argsDoc["item"].as<String>();
+                    item.toLowerCase(); 
+                    
+                    int quantity = 1; 
+                    if (argsDoc.containsKey("quantity")) {
+                        quantity = argsDoc["quantity"].as<int>();
+                    }
+                    
+                    if (listName.length() > 0 && item.length() > 0 && quantity > 0) {
+                        int current_quantity = todoLists[listName][item];
+                        todoLists[listName][item] = current_quantity + quantity;
+                        saveTodoLists();
+                        broadcastTodoLists(); // --- SYNC TO UI ---
+                        
+                        int total = todoLists[listName][item];
+                        toolResult = "Got it! I've added " + String(quantity) + " '" + item + "' to your " + listName + " list. You now have " + String(total) + ".";
+                    } else {
+                        toolResult = "I need a list name, item, and a quantity to add something. Can you try that again?";
+                    }
+                    allBypass = false; 
+
+                } else if (call.toolToCall == "remove_todo_item") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    
+                    String listName = argsDoc["list_name"].as<String>();
+                    listName.toLowerCase();
+                    String item = argsDoc["item"].as<String>();
+                    item.toLowerCase();
+
+                    if (todoLists.find(listName) == todoLists.end() || todoLists[listName].find(item) == todoLists[listName].end()) {
+                        toolResult = "Hmm, I can't find '" + item + "' on your " + listName + " list.";
+                    } else {
+                        if (argsDoc.containsKey("quantity")) {
+                            int quantityToRemove = argsDoc["quantity"].as<int>();
+                            int current_quantity = todoLists[listName][item];
+                            todoLists[listName][item] = current_quantity - quantityToRemove;
+
+                            if (todoLists[listName][item] <= 0) {
+                                todoLists[listName].erase(item);
+                                saveTodoLists();
+                                broadcastTodoLists(); // --- SYNC TO UI ---
+                                toolResult = "All done! I've crossed off all '" + item + "' from your " + listName + " list.";
+                            } else {
+                                saveTodoLists();
+                                broadcastTodoLists(); // --- SYNC TO UI ---
+                                toolResult = "Got it! I removed " + String(quantityToRemove) + " '" + item + "'. You still have " + String(todoLists[listName][item]) + " left.";
+                            }
+                        } else {
+                            todoLists[listName].erase(item);
+                            saveTodoLists();
+                            broadcastTodoLists(); // --- SYNC TO UI ---
+                            toolResult = "Perfect! I've cleared all '" + item + "' from your " + listName + " list.";
+                        }
+                    }
+                    allBypass = false; 
+
+                } else if (call.toolToCall == "list_todo_items") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    
+                    if (argsDoc.containsKey("list_name")) {
+                        String listName = argsDoc["list_name"].as<String>();
+                        listName.toLowerCase();
+
+                        if (todoLists.find(listName) == todoLists.end() || todoLists[listName].empty()) {
+                            toolResult = "Your " + listName + " list is empty.";
+                        } else {
+                            std::map<String, int> &list = todoLists[listName];
+                            toolResult = "Here's what's on your " + listName + " list: ";
+                            for (auto const& [item_name, quantity] : list) {
+                                toolResult += item_name;
+                                if (quantity > 1) {
+                                    toolResult += " (" + String(quantity) + ")";
+                                }
+                                toolResult += ", ";
+                            }
+                        }
+                    } else {
+                        if (todoLists.empty()) {
+                            toolResult = "You haven't created any to-do lists yet.";
+                        } else {
+                            toolResult = "You have " + String(todoLists.size()) + " list" + (todoLists.size() > 1 ? "s" : "") + ": ";
+                            for (auto const& [listName, innerMap] : todoLists) {
+                                toolResult += listName + " (with " + String(innerMap.size()) + " item" + (innerMap.size() > 1 ? "s" : "") + "), ";
+                            }
+                        }
+                    }
+                    
+                    // --- THIS IS THE FIX ---
+                    allBypass = false; 
+                    // --- END FIX ---
+
+                } else if (call.toolToCall == "clear_todo_list") {
+                    JsonDocument argsDoc;
+                    deserializeJson(argsDoc, call.toolArguments);
+                    
+                    String listName = argsDoc["list_name"].as<String>();
+                    listName.toLowerCase();
+
+                    if (todoLists.find(listName) == todoLists.end()) {
+                        toolResult = "Sorry, I couldn't find a list named '" + listName + "' to clear.";
+                    } else {
+                        todoLists.erase(listName);
+                        broadcastTodoLists(); // --- SYNC TO UI ---
+                        toolResult = "I've cleared your entire " + listName + " list.";
+                    }
+                    allBypass = false;
+                
+                } else {
+                    toolResult = "Unknown tool: " + call.toolToCall;
+                    bypassAiCall2 = true;
+                }
+                // --- End of Tool execution block ---
+
+                Serial.println("Tool result: " + toolResult);
+                addToHistory("tool", toolResult, call.toolCallId); 
+                
+                if (bypassAiCall2) {
+                    combinedToolResults += toolResult + " ";
+                }
+                if (!bypassAiCall2) {
+                    allBypass = false; 
+                }
+            } // --- END of loop through tool calls ---
+
+            
+            // --- Decide what to do after all tools have run ---
+            if (allBypass) {
+                Serial.println("Bypassing AI Call 2. Speaking combined tool results.");
+                speakText(combinedToolResults); 
+            } else {
+                Serial.println("Sending tool results to AI for summary...");
+                GptResponse response2 = chatWithGpt();
+                if (response2.textToSpeak.length() > 0) {
+                    String cleanedText = response2.textToSpeak;
+                    cleanedText.replace("**", ""); 
+                    cleanedText.replace("*", "");  
+                    speakText(cleanedText); 
+                    addToHistory("assistant", cleanedText);
+                } else {
+                    String errorMsg = "Oops, looks like I ran into a little hiccup while getting that information for you. Let me try again!";
+                    speakText(errorMsg);
+                    addToHistory("assistant", errorMsg); 
+                }
+            }
+        } else if (response1.textToSpeak.length() > 0) {
+            String cleanedText = response1.textToSpeak;
+            cleanedText.replace("**", ""); 
+            cleanedText.replace("*", "");  
+            
+            // Check if response contains network/WiFi info (case-insensitive, handles variations)
+            String lowerResponse = cleanedText;
+            lowerResponse.toLowerCase();
+            lowerResponse.replace("-", " ");  // Handle "wi-fi" -> "wi fi"
+            if (lowerResponse.indexOf("ip address") != -1 || lowerResponse.indexOf("ip:") != -1 || 
+                lowerResponse.indexOf("wifi") != -1 || lowerResponse.indexOf("wi fi") != -1 || 
+                lowerResponse.indexOf("network") != -1 || lowerResponse.indexOf("ssid") != -1) {
+                showNetworkInfo = true;
+                networkInfoStartTime = millis();
+            }
+            
+            speakText(cleanedText); 
+            addToHistory("assistant", cleanedText);
+        } else {
+            String errorMsg = "Sorry, I didn't quite catch that. Could you say it again?";
+            speakText(errorMsg);
+            addToHistory("assistant", errorMsg); 
+        }
+    } else {
+        Serial.println("❌ Recording too short.");
+    }
+    currentState = S_IDLE;
+    currentAIState = AI_IDLE;
+    broadcastState(AI_IDLE); // --- SYNC TO UI ---
+}
+
+// ========== HTTP REQUEST HANDLERS ==========
+// WebServer endpoints for API calls and file serving
+
+void handleStateAPI() {
+  String state = stateToString();
+  String json = "{\"state\":\"" + state + "\",\"historyCount\":" + String(transactionHistory.size()) + ",\"imageCount\":" + String(imageCaptureCounter) + ",\"alarmCount\":" + String(alarmUpdateCounter) + "}";
+  server.send(200, "application/json", json);
+}
+
+// --- SPIFFS-based file serving helpers (serves files from SPIFFS, no inline HTML) ---
+String getContentType(const String& filename) {
+  if (filename.endsWith(".html")) return "text/html";
+  if (filename.endsWith(".css")) return "text/css";
+  if (filename.endsWith(".js")) return "application/javascript";
+  if (filename.endsWith(".png")) return "image/png";
+  if (filename.endsWith(".jpg") || filename.endsWith(".jpeg")) return "image/jpeg";
+  if (filename.endsWith(".ico")) return "image/x-icon";
+  if (filename.endsWith(".json")) return "application/json";
+  if (filename.endsWith(".txt")) return "text/plain";
+  return "application/octet-stream";
+}
+
+void handleFile() {
+  // Serve static files from embedded data
+  String path = server.uri();
+  if (path == "/") path = "/index.html";
+  if (!path.startsWith("/")) path = "/" + path;
+
+  // Serve embedded HTML directly
+  if (path == "/index.html") {
+    server.send_P(200, PSTR("text/html"), INDEX_HTML);
+    return;
+  }
+
+  // Fallback to SPIFFS for other files (CSS, JS, images)
+  if (SPIFFS.exists(path)) {
+    File f = SPIFFS.open(path, "r");
+    if (!f) {
+      server.send(500, "text/plain", "Failed to open file");
+      return;
+    }
+    String contentType = getContentType(path);
+    server.streamFile(f, contentType);
+    f.close();
+  } else {
+    server.send(404, "text/plain", "404: Not found");
+  }
+}
+
+void handleTasksData() {
+  // Task/Alarm UI is dynamic; serve a small HTML fragment from SPIFFS if available.
+  // The firmware no longer inlines large HTML strings. Place a template at '/templates/tasks_fragment.html' in SPIFFS
+  // that contains placeholders if desired. If not found, build a minimal HTML fallback.
+  String templatePath = "/templates/tasks_fragment.html";
+  if (SPIFFS.exists(templatePath)) {
+    File f = SPIFFS.open(templatePath, "r");
+    if (f) {
+      server.streamFile(f, "text/html");
+      f.close();
+      return;
+    }
+  }
+
+  // Minimal fallback (keeps response small and avoids inlining the full page)
+  String html = "";
+  if (alarmTriggerTime != 0) {
+    unsigned long ms_remaining = (alarmTriggerTime > millis()) ? (alarmTriggerTime - millis()) : 0;
+    if (ms_remaining > 0) {
+      unsigned long seconds = ms_remaining / 1000;
+      unsigned long minutes = seconds / 60;
+      unsigned long secs = seconds % 60;
+      html += "<div class='alarm-active'>";
+      html += "<p>Alarm Active</p>";
+      html += "<p>";
+      if (minutes > 0) html += String(minutes) + " min ";
+      html += String(secs) + " sec";
+      html += "</p></div>";
+    } else {
+      html += "<div class='alarm-inactive'><p>No active alarm</p></div>";
+    }
+  } else {
+    html += "<div class='alarm-inactive'><p>No active alarm</p></div>";
+  }
+  server.send(200, "text/html", html);
+}
+
+void handleClearChat() {
+  clearChatHistory();
+  broadcastChatHistory(); // Sync UI
+  server.send(200, "text/plain", "Chat history cleared");
+}
+
+void handleClearGallery() {
+  lastCapturedImage.clear();
+  imageCaptureCounter = 0;
+  if (SPIFFS.exists("/last_image.jpg")) {
+    SPIFFS.remove("/last_image.jpg");
+  }
+  broadcastGallery(); // Sync UI
+  server.send(200, "text/plain", "Gallery cleared");
+}
+
+void handleClearTodos() {
+  clearTodoLists();
+  broadcastTodoLists(); // Sync UI
+  server.send(200, "text/plain", "Todo lists cleared");
+}
+
+void handleCancelAlarm() {
+  if (alarmTriggerTime != 0 || currentAIState == AI_ALARMING) {
+    alarmTriggerTime = 0;
+    audio.stopSong();
+    alarmSoundStarted = false; // <--- Reset flag
+    currentAIState = AI_IDLE;
+    broadcastState(AI_IDLE);
+    broadcastAlarm(0, false);
+    server.send(200, "application/json", "{\"status\":\"alarm_cancelled\"}");
+  } else {
+    server.send(200, "application/json", "{\"status\":\"no_alarm_to_cancel\"}");
+  }
+}
+
+// --- DIRECT ALARM TONE GENERATION (using I2S audio out) ---
+void generateAlarmBeep() {
+    // Generate a simple beep tone using the Audio library's built-in capabilities
+    // This creates a pure sine wave and plays it through the I2S speaker
+    
+    Serial.println("🔊 Playing alarm beep...");
+    
+    // Use the Audio library's tone generation if available
+    // For now, play a brief silence to clear any buffered audio first
+    audio.stopSong();
+    yield();
+    
+    // Alternative: Generate simple PWM beep on a GPIO pin if available
+    // For now just log that we're playing
+    Serial.println("✓ Beep sent to I2S");
+}
+
+// --- RTTTL ENDPOINT (fallback, kept for compatibility) ---
+void handleRtttlAlarm() {
+  // This endpoint serves a quick WAV beep that the audio library can play
+  Serial.println("📞 Serving WAV alarm beep from HTTP...");
+  
+  // ULTRA-SHORT beep to minimize HTTP transfer time and blocking
+  const int sampleRate = 8000; // Very low sample rate for small size
+  const float duration = 0.15; // Only 150ms
+  const int frequency = 1000;
+  const int numSamples = (int)(sampleRate * duration);
+  
+  uint8_t wavHeader[44];
+  int fileSize = 36 + numSamples * 2;
+  
+  wavHeader[0] = 'R'; wavHeader[1] = 'I'; wavHeader[2] = 'F'; wavHeader[3] = 'F';
+  wavHeader[4] = (fileSize) & 0xFF;
+  wavHeader[5] = (fileSize >> 8) & 0xFF;
+  wavHeader[6] = (fileSize >> 16) & 0xFF;
+  wavHeader[7] = (fileSize >> 24) & 0xFF;
+  wavHeader[8] = 'W'; wavHeader[9] = 'A'; wavHeader[10] = 'V'; wavHeader[11] = 'E';
+  
+  wavHeader[12] = 'f'; wavHeader[13] = 'm'; wavHeader[14] = 't'; wavHeader[15] = ' ';
+  wavHeader[16] = 16; wavHeader[17] = 0; wavHeader[18] = 0; wavHeader[19] = 0;
+  wavHeader[20] = 1; wavHeader[21] = 0;
+  wavHeader[22] = 1; wavHeader[23] = 0;
+  wavHeader[24] = (sampleRate) & 0xFF;
+  wavHeader[25] = (sampleRate >> 8) & 0xFF;
+  wavHeader[26] = (sampleRate >> 16) & 0xFF;
+  wavHeader[27] = (sampleRate >> 24) & 0xFF;
+  wavHeader[28] = (sampleRate * 2) & 0xFF;
+  wavHeader[29] = (sampleRate * 2 >> 8) & 0xFF;
+  wavHeader[30] = (sampleRate * 2 >> 16) & 0xFF;
+  wavHeader[31] = (sampleRate * 2 >> 24) & 0xFF;
+  wavHeader[32] = 2; wavHeader[33] = 0;
+  wavHeader[34] = 16; wavHeader[35] = 0;
+  
+  wavHeader[36] = 'd'; wavHeader[37] = 'a'; wavHeader[38] = 't'; wavHeader[39] = 'a';
+  wavHeader[40] = (numSamples * 2) & 0xFF;
+  wavHeader[41] = (numSamples * 2 >> 8) & 0xFF;
+  wavHeader[42] = (numSamples * 2 >> 16) & 0xFF;
+  wavHeader[43] = (numSamples * 2 >> 24) & 0xFF;
+  
+  server.setContentLength(44 + numSamples * 2);
+  server.send(200, "audio/wav", "");
+  
+  // Send WAV header quickly
+  for (int i = 0; i < 44; i++) {
+    server.sendContent((const char*)&wavHeader[i], 1);
+  }
+  
+  // Generate samples ultra-fast
+  for (int i = 0; i < numSamples; i++) {
+    float phase = 2.0 * 3.14159265 * frequency * i / sampleRate;
+    int16_t sample = (int16_t)(10000.0 * sin(phase)); // Lower amplitude to be safe
+    
+    uint8_t low = sample & 0xFF;
+    uint8_t high = (sample >> 8) & 0xFF;
+    server.sendContent((const char*)&low, 1);
+    server.sendContent((const char*)&high, 1);
+  }
+  
+  Serial.println("✓ Quick WAV beep served (150ms)");
+}
+
+void handleRoot() {
+  handleFile();
+}
+
+// ========== BACKGROUND NTP SYNC ==========
+// Continuously tries to sync time if not yet synced
+void backgroundNTPSync() {
+    static unsigned long last_ntp_attempt = 0;
+    time_t current_time = time(nullptr);
+    
+    // Try NTP sync every 60 seconds if time is not synced
+    if (current_time < 24 * 3600 && millis() - last_ntp_attempt > 60000) {
+        last_ntp_attempt = millis();
+        Serial.println("\n🔄 Background NTP sync attempt...");
+        
+        // Refresh time from NTP servers (auto-discovery)
+        configTime(5 * 3600 + 30 * 60, 0, 
+                  "pool.ntp.org", "time.nist.gov", "time.google.com");
+        
+        delay(3000);  // Wait 3 seconds for sync attempt
+        
+        current_time = time(nullptr);
+        if (current_time > 24 * 3600) {
+            Serial.println("✓ Background NTP sync successful!");
+            struct tm timeinfo;
+            localtime_r(&current_time, &timeinfo);
+            char buffer[80];
+            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S IST", &timeinfo);
+            Serial.printf("  Current time: %s\n", buffer);
+        }
+    }
+}
+
+void initCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    
+    // Data Pins
+    config.pin_d0 = Y2_GPIO_NUM; 
+    config.pin_d1 = Y3_GPIO_NUM; 
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM; 
+    config.pin_d4 = Y6_GPIO_NUM; 
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM; 
+    config.pin_d7 = Y9_GPIO_NUM;
+    
+    // Clock and Sync Pins
+    config.pin_xclk = XCLK_GPIO_NUM; 
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM; 
+    config.pin_href = HREF_GPIO_NUM;
+    
+    // SCCB (I2C Control) Pins
+    config.pin_sccb_sda = SIOD_GPIO_NUM; 
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+    
+    // Power and Reset
+    config.pin_pwdn = PWDN_GPIO_NUM; 
+    config.pin_reset = RESET_GPIO_NUM;
+    
+    // Capture Parameters
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_QVGA;  // 320x240 - optimized for speed/vision API
+    config.jpeg_quality = 15;            // 0-63, lower means higher quality
+    config.fb_count = 1;                 // Dual frame buffers for smoother streaming
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+    // Initialize the hardware
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x", err);
+        speakText("I'm having trouble starting my camera. This is something I'll need help to fix.");
+        while(1); // Halt if camera fails
+    }
+    
+    // Sensor-specific tuning (OV3660)
+    sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+        s->set_vflip(s, 0);              // Set vertical flip (0 or 1)
+        s->set_hmirror(s, 0);            // Set horizontal mirror (0 or 1)
+        
+        // Image quality settings for AI analysis
+        s->set_exposure_ctrl(s, 1);      // Enable auto-exposure
+        s->set_aec2(s, 1);               // Enable AEC2 for OV3660
+        s->set_gain_ctrl(s, 1);          // Enable auto-gain
+        s->set_agc_gain(s, 6);           // Moderate gain ceiling
+        s->set_brightness(s, 0);         // Neutral brightness
+        s->set_quality(s, 12);           // Maintain JPEG quality
+    }
+    
+    Serial.println("Camera initialized.");
+}
+
+void handleVisionRequest() {
+    cameraInUse = true;  // Signal that camera is needed
+    
+    speakText("Sure thing! Let me take a look.");
+    currentAIState = AI_THINKING;
+    
+    // Flush old frames from buffer to ensure a fresh image
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t *fb_flush = esp_camera_fb_get();
+        if (fb_flush) { esp_camera_fb_return(fb_flush); }
+        delay(100);
+    }
+    
+    // Now capture a fresh frame
+    delay(200);  // Wait for camera sensor to settle
+    camera_fb_t *fb = esp_camera_fb_get();
+    
+    if (!fb || fb->len == 0) {
+        Serial.println("Camera capture failed");
+        speakText("Hmm, I'm having trouble with my camera right now. Could you try again?");
+        cameraInUse = false;  // Release flag
+        return;
+    }
+    
+    Serial.printf("📸 Captured frame size: %d bytes\n", fb->len);
+    
+    // Store for the Web UI gallery
+    lastCapturedImage.assign(fb->buf, fb->buf + fb->len);
+    imageCaptureCounter++;  
+    
+    // Notify Web UI via WebSocket
+    StaticJsonDocument<32> doc;
+    doc["image_ready"] = true;
+    String json;
+    serializeJson(doc, json);
+    sendToAllClients(json); 
+    broadcastGallery();  
+
+    // Encode to Base64 for the API request
+    String encodedImage = base64::encode(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    cameraInUse = false;  // Release flag
+    
+    // Send to GPT-4o-mini with a specific vision prompt
+    GptResponse visionResponse = chatWithGpt("Describe what you see in a short sentence.", encodedImage);
+    
+    if (visionResponse.textToSpeak.length() > 0) {
+        Serial.print("🤖 Vision says: "); Serial.println(visionResponse.textToSpeak);
+        speakText(visionResponse.textToSpeak);
+        
+    } else {
+        speakText("I'm sorry, I couldn't understand what I'm seeing.");
+    }
+}
+
+void loop() {
+    ArduinoOTA.handle();
+    server.handleClient();
+    webSocket.loop();
+    
+    static unsigned long lastAudioLoop = 0;
+    static unsigned long audioLoopStart = 0;
+    
+    if (!audio.isRunning()) {
+        audioLoopStart = millis();
+    }
+    
+    audio.loop();
+    
+    for (int i = 0; i < 10; i++) yield();
+    
+    backgroundNTPSync();
+
+    // Speak introduction on first loop iteration after setup completes
+    if (!introSpoken && currentAIState == AI_IDLE) {
+        speakDefaultIntroduction(); // Execution stays here until intro finishes
+        introSpoken = true;          // The "lock" is now disengaged
+        Serial.println("✅ Intro finished. Touch controls activated.");
+    }
+
+    // --- ALARM TRIGGER AND LOOP LOGIC ---
+    if (alarmTriggerTime != 0 && millis() >= alarmTriggerTime) {
+        currentAIState = AI_ALARMING;
+        alarmSoundStarted = false;
+        alarmLoopStartTime = millis();
+        broadcastState(AI_ALARMING);
+        broadcastAlarm(alarmTriggerTime, true);
+        Serial.println("ALARM TRIGGERED!");
+        alarmTriggerTime = 0;
+    }
+    
+    if (currentAIState == AI_ALARMING) {
+        // Keep restarting alarm sound until timeout (120 seconds)
+        if (!audio.isRunning()) {
+            // Audio finished playing, restart it for continuous alarm
+            Serial.println("🔊 ALARM - restarting audio...");
+            playAlarmTone();
+        }
+        
+        // Auto-stop alarm after 120 seconds
+        if (millis() - alarmLoopStartTime > 120000) {
+            Serial.println("⏱️  Alarm timeout - stopping after 120 seconds");
+            audio.stopSong();
+            currentAIState = AI_IDLE;
+            alarmSoundStarted = false;
+            broadcastState(AI_IDLE);
+        }
+    }
+    // --- END ALARM LOGIC ---
+    
+    updateAnimation(); 
+
+    // Allow touch for alarm dismissal OR normal interactions once intro is complete
+    currentTouchValue = touchRead(BUTTON_PIN);
+    bool currentTouchState = (touchRead(BUTTON_PIN) > TOUCH_THRESHOLD);
+    
+    // Special case: allow alarm dismissal anytime (even before intro)
+    if (currentAIState == AI_ALARMING) {
+        static unsigned long alarmTouchStart = 0;
+        static bool alarmTouchActive = false;
+        
+        if (currentTouchState && !alarmTouchActive) {
+            alarmTouchStart = millis();
+            alarmTouchActive = true;
+        } else if (!currentTouchState && alarmTouchActive) {
+            Serial.println("Alarm stopped by touch.");
+            audio.stopSong();
+            currentAIState = AI_IDLE;
+            alarmTriggerTime = 0;
+            alarmSoundStarted = false;
+            broadcastState(AI_IDLE);
+            broadcastAlarm(0, false);
+            alarmTouchActive = false;
+        }
+    }
+
+    // Only allow normal touch interactions once the intro is complete
+    if (introSpoken) {
+        static unsigned long touchStartTime = 0; 
+        static bool touchActive = false; 
+        unsigned long touchDuration = 0;
+
+        if (currentTouchState && !touchActive) {
+            touchStartTime = millis(); 
+            touchActive = true;
+            // No delay here - non-blocking debounce using millis() instead
+        } else if (!currentTouchState && touchActive) {
+            touchDuration = millis() - touchStartTime;
+
+            if (currentAIState != AI_ALARMING) {
+                if (currentState == S_IDLE && touchDuration < 500) {
+                    unsigned long now = millis();
+                    
+                    if (now - lastTapTime < DOUBLE_TAP_TIME_MS) {
+                        Serial.println("Double-tap detected - toggling surveillance mode");
+                        if (currentAIState != AI_SURVEILLANCE) {
+                            inSurveillanceMode = true;
+                            currentAIState = AI_SURVEILLANCE;
+                            cameraInUse = false;
+                            broadcastState(AI_SURVEILLANCE);
+                            broadcastCameraMode("live");
+                            Serial.println(">>> System now ready for MJPEG streaming - surveillance started.");
+                            
+                            audio.setVolume(21);
+                            Serial.println("🔊 Surveillance activated");
+                        } else {
+                            inSurveillanceMode = false;
+                            currentAIState = AI_IDLE;
+                            cameraInUse = false;
+                            broadcastState(AI_IDLE);
+                            broadcastCameraMode("off");
+                            Serial.println(">>> Surveillance mode stopped.");
+                            
+                            speakText("I have stopped watching.");
+                        }
+                        lastTapTime = 0;
+                    } else {
+                        lastTapTime = now;
+                        
+                        // Only toggle display if NOT in surveillance mode
+                        if (currentAIState == AI_IDLE) {
+                            Serial.println("Short tap detected - switching idle mode.");
+                            currentIdleDisplay = (currentIdleDisplay == IDLE_EYES) ? IDLE_INFO : IDLE_EYES;
+                            updateAnimation(); 
+                        }
+                    }
+                }
+            }
+            
+            touchActive = false; 
+        } else if (currentTouchState && touchActive && currentState == S_IDLE) {
+            touchDuration = millis() - touchStartTime;
+            if (touchDuration >= 500) {
+                Serial.println("Long press detected - starting recording.");
+                currentState = S_RECORDING; 
+                int samples_recorded = recordAudio(); 
+                int bytes_recorded = samples_recorded * sizeof(int16_t); 
+                currentState = S_TRANSCRIBING; 
+                processAudio(bytes_recorded, samples_recorded); 
+                touchActive = false;
+            }
+        }
+    }
+}
+
+int recordAudio() {
+    Serial.println("\n🎤 Listening... (press and hold)");
+    currentAIState = AI_LISTENING;
+    broadcastState(AI_LISTENING);
+    updateAnimation(); 
+    int samples_read = 0;
+    int max_samples = audio_buffer_size / sizeof(int16_t);
+    
+    while (touchRead(BUTTON_PIN) > TOUCH_THRESHOLD && samples_read < max_samples) {
+        server.handleClient();
+
+        int16_t sample_chunk[256];
+        size_t bytes_read = I2S.readBytes((char*)sample_chunk, sizeof(sample_chunk));
+        int samples_in_chunk_read = bytes_read / sizeof(int16_t);
+        
+        for (int i = 0; i < samples_in_chunk_read && samples_read < max_samples; i++) {
+            audio_buffer[samples_read++] = sample_chunk[i];
+        }
+        updateAnimation();
+        delay(1);
+    }
+    
+    Serial.printf("✅ Recording finished. %d samples read.\n", samples_read);
+    return samples_read;
+}
+
+
+GptResponse chatWithGpt(String vision_prompt, String image) {
+    currentAIState = AI_THINKING;
+    broadcastState(AI_THINKING);
+    GptResponse response;
+    StaticJsonDocument<8192> doc;
+    doc["model"] = "gpt-4o-mini";
+    doc["max_tokens"] = 150;
+    JsonArray messages = doc.createNestedArray("messages");
+    bool isVisionRequest = (image.length() > 0);
+    
+    // Build system prompt with current time context
+    String systemPrompt = "You are Kiko, a friendly and helpful voice AI assistant. You're warm, approachable, and always ready to help. Speak in a conversational and natural way, like a helpful friend. Be enthusiastic when appropriate. Keep responses concise but friendly. Use simple language that's easy to understand. When using tools, do so naturally without mentioning them. Never make up information - if you don't know something, say so. Always be honest and genuine in your responses. Do not use emojis in your responses. ";
+    
+    // Add current date/time to system prompt so GPT knows it's available
+    time_t now = time(nullptr);
+    if (now > 24 * 3600) {  // If time is synced
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char buffer[100];
+        strftime(buffer, sizeof(buffer), "Current date and time: %I:%M %p on %A, %B %d, %Y", &timeinfo);
+        if (buffer[0] == '0') {
+            systemPrompt += String(buffer).substring(1);  // Remove leading zero from hour
+        } else {
+            systemPrompt += String(buffer);
+        }
+    }
+    JsonObject systemMessage = messages.createNestedObject();
+    systemMessage["role"] = "system";
+    systemMessage["content"] = systemPrompt;
+
+    if (isVisionRequest) {  
+        JsonObject userMessage = messages.createNestedObject();
+        userMessage["role"] = "user";
+        JsonArray content = userMessage.createNestedArray("content");
+        JsonObject textPart = content.createNestedObject();
+        textPart["type"] = "text";
+        textPart["text"] = vision_prompt;
+        JsonObject imagePart = content.createNestedObject();
+        imagePart["type"] = "image_url";
+        imagePart["image_url"]["url"] = "data:image/jpeg;base64," + image;
+    } else {
+        for (const auto& msg : chatHistory) {
+            JsonObject message = messages.createNestedObject();
+            message["role"] = msg.role;
+            if (msg.role == "assistant") {
+                
+                JsonDocument assistantMsgDoc;
+                if (deserializeJson(assistantMsgDoc, msg.content) == DeserializationError::Ok && assistantMsgDoc.containsKey("tool_calls")) {
+                    
+                    message.set(assistantMsgDoc.as<JsonObject>());
+                } else {
+                    message["content"] = msg.content;
+                }
+            } else if (msg.role == "tool") {
+                message["content"] = msg.content;
+                message["tool_call_id"] = msg.tool_call_id;
+            } else {
+                
+                message["content"] = msg.content;
+            }
+        }
+
+        // --- ALL CORRECTED TOOLS ARE DEFINED HERE ---
+        JsonArray tools = doc.createNestedArray("tools"); 
+        
+        JsonObject getWeatherTool = tools.createNestedObject();
+        getWeatherTool["type"] = "function";
+        JsonObject getWeatherFunc = getWeatherTool.createNestedObject("function");
+        getWeatherFunc["name"] = "get_weather";
+        getWeatherFunc["description"] = "Gets the current weather for a specific city.";
+        JsonObject weatherParams = getWeatherFunc.createNestedObject("parameters");
+        weatherParams["type"] = "object";
+        JsonObject weatherProps = weatherParams.createNestedObject("properties");
+        weatherProps["city"]["type"] = "string";
+        weatherProps["city"]["description"] = "The city, e.g., 'San Francisco'";
+        weatherParams["required"][0] = "city";      
+        
+        JsonObject getNetworkTool = tools.createNestedObject();
+        getNetworkTool["type"] = "function";
+        JsonObject getNetworkFunc = getNetworkTool.createNestedObject("function");
+        getNetworkFunc["name"] = "get_network_info";
+        getNetworkFunc["description"] = "Gets the device's local network information including WiFi SSID, IP address, and signal strength. This is safe to share as it's the user's own device's information.";
+        JsonObject networkParams = getNetworkFunc.createNestedObject("parameters");
+        networkParams["type"] = "object";
+        JsonObject networkProps = networkParams.createNestedObject("properties");  // Add empty properties object
+        
+        JsonObject getSearchTool = tools.createNestedObject();
+        getSearchTool["type"] = "function";
+        JsonObject getSearchFunc = getSearchTool.createNestedObject("function");
+        getSearchFunc["name"] = "google_search";
+        getSearchFunc["description"] = "Searches Google for real-time information, news, definitions, or facts not in your knowledge base.";
+        JsonObject searchParams = getSearchFunc.createNestedObject("parameters");
+        searchParams["type"] = "object";
+        JsonObject searchProps = searchParams.createNestedObject("properties");
+        searchProps["query"]["type"] = "string";
+        searchProps["query"]["description"] = "The search query, e.g., 'latest news on Mars rover'";
+        searchParams["required"][0] = "query";
+        
+        // --- ALARM TOOLS (Unchanged) ---
+        JsonObject setAlarmRelTool = tools.createNestedObject();
+        setAlarmRelTool["type"] = "function";
+        JsonObject setAlarmRelFunc = setAlarmRelTool.createNestedObject("function");
+        setAlarmRelFunc["name"] = "set_alarm_relative";
+        setAlarmRelFunc["description"] = "Sets an alarm to go off after a specified duration, e.g., 'in 5 minutes' or 'for 30 seconds'.";
+        JsonObject alarmRelParams = setAlarmRelFunc.createNestedObject("parameters");
+        alarmRelParams["type"] = "object";
+        JsonObject alarmRelProps = alarmRelParams.createNestedObject("properties");
+        alarmRelProps["delay_seconds"]["type"] = "number";
+        alarmRelProps["delay_seconds"]["description"] = "The number of seconds from now to set the alarm for.";
+        alarmRelParams["required"][0] = "delay_seconds";
+        JsonObject setAlarmAbsTool = tools.createNestedObject();
+        setAlarmAbsTool["type"] = "function";
+        JsonObject setAlarmAbsFunc = setAlarmAbsTool.createNestedObject("function");
+        setAlarmAbsFunc["name"] = "set_alarm_absolute";
+        setAlarmAbsFunc["description"] = "Sets an alarm for a specific time of day, e.g., 'at 2:30 PM' or 'for 11:00 AM'.";
+        JsonObject alarmAbsParams = setAlarmAbsFunc.createNestedObject("parameters");
+        alarmAbsParams["type"] = "object";
+        JsonObject alarmAbsProps = alarmAbsParams.createNestedObject("properties");
+        alarmAbsProps["hour"]["type"] = "number";
+        alarmAbsProps["hour"]["description"] = "The target hour, in 1-12 format.";
+        alarmAbsProps["minute"]["type"] = "number";
+        alarmAbsProps["minute"]["description"] = "The target minute (0-59).";
+        alarmAbsProps["period"]["type"] = "string";
+        alarmAbsProps["period"]["description"] = "The period of day, either 'AM' or 'PM'.";
+        alarmAbsParams["required"][0] = "hour";
+        alarmAbsParams["required"][1] = "minute";
+        alarmAbsParams["required"][2] = "period";
+        JsonObject getAlarmTool = tools.createNestedObject();
+        getAlarmTool["type"] = "function";
+        JsonObject getAlarmFunc = getAlarmTool.createNestedObject("function");
+        getAlarmFunc["name"] = "get_alarm_status";
+        getAlarmFunc["description"] = "Checks if an alarm is currently set and, if so, when it is scheduled to ring.";
+        JsonObject cancelAlarmTool = tools.createNestedObject();
+        cancelAlarmTool["type"] = "function";
+        JsonObject cancelAlarmFunc = cancelAlarmTool.createNestedObject("function");
+        cancelAlarmFunc["name"] = "cancel_alarm";
+        cancelAlarmFunc["description"] = "Cancels any alarm that is currently set and waiting to ring.";
+
+        // --- MODIFIED: TODO LIST TOOLS (Smarter Prompts) ---
+
+        // 1. Add To-Do
+        JsonObject addTodoTool = tools.createNestedObject();
+        addTodoTool["type"] = "function";
+        JsonObject addTodoFunc = addTodoTool.createNestedObject("function");
+        addTodoFunc["name"] = "add_todo_item";
+        addTodoFunc["description"] = "Adds an item to a to-do list. If the item already exists, its quantity is increased.";
+        JsonObject todoAddParams = addTodoFunc.createNestedObject("parameters");
+        todoAddParams["type"] = "object";
+        JsonObject todoAddProps = todoAddParams.createNestedObject("properties");
+        todoAddProps["list_name"]["type"] = "string";
+        todoAddProps["list_name"]["description"] = "The name of the list, e.g., 'groceries', 'work'.";
+        todoAddProps["item"]["type"] = "string";
+        // --- THIS DESCRIPTION IS MODIFIED ---
+        todoAddProps["item"]["description"] = "The name of the item. If units are given (e.g., kg, litres), include them in the name. e.g., 'apples', 'rice (kg)', 'milk (litres)'.";
+        todoAddProps["quantity"]["type"] = "number";
+        // --- THIS DESCRIPTION IS MODIFIED ---
+        todoAddProps["quantity"]["description"] = "The quantity for the item. Must be extracted from the user's request (e.g., '1' for '1 kg rice', '3' for '3 apples'). Defaults to 1 if not specified.";
+        todoAddParams["required"][0] = "list_name";
+        todoAddParams["required"][1] = "item";
+
+        // 2. Remove To-Do
+        JsonObject removeTodoTool = tools.createNestedObject();
+        removeTodoTool["type"] = "function";
+        JsonObject removeTodoFunc = removeTodoTool.createNestedObject("function");
+        removeTodoFunc["name"] = "remove_todo_item";
+        removeTodoFunc["description"] = "Removes an item from a to-do list. If quantity is provided, it subtracts that amount. If no quantity is provided, it removes the item entirely.";
+        JsonObject todoRemoveParams = removeTodoFunc.createNestedObject("parameters");
+        todoRemoveParams["type"] = "object";
+        JsonObject todoRemoveProps = todoRemoveParams.createNestedObject("properties");
+        todoRemoveProps["list_name"]["type"] = "string";
+        todoRemoveProps["list_name"]["description"] = "The name of the list, e.g., 'groceries'.";
+        todoRemoveProps["item"]["type"] = "string";
+        // --- THIS DESCRIPTION IS MODIFIED ---
+        todoRemoveProps["item"]["description"] = "The name of the item to remove. Must match the stored name, e.g., 'apples', 'rice (kg)'.";
+        todoRemoveProps["quantity"]["type"] = "number";
+        todoRemoveProps["quantity"]["description"] = "The quantity to remove. If not specified, all items of this type are removed.";
+        todoRemoveParams["required"][0] = "list_name";
+        todoRemoveParams["required"][1] = "item";
+
+        // 3. List To-Dos (Unchanged)
+        JsonObject listTodoTool = tools.createNestedObject();
+        listTodoTool["type"] = "function";
+        JsonObject listTodoFunc = listTodoTool.createNestedObject("function");
+        listTodoFunc["name"] = "list_todo_items";
+        listTodoFunc["description"] = "Gets all items and their quantities from a specific to-do list. If no list_name is given, it lists all available to-do lists.";
+        JsonObject todoListParams = listTodoFunc.createNestedObject("parameters");
+        todoListParams["type"] = "object";
+        JsonObject todoListProps = todoListParams.createNestedObject("properties");
+        todoListProps["list_name"]["type"] = "string";
+        todoListProps["list_name"]["description"] = "The name of the list to read, e.g., 'groceries'.";
+
+        // 4. Clear To-Dos (Unchanged)
+        JsonObject clearTodoTool = tools.createNestedObject();
+        clearTodoTool["type"] = "function";
+        JsonObject clearTodoFunc = clearTodoTool.createNestedObject("function");
+        clearTodoFunc["name"] = "clear_todo_list";
+        clearTodoFunc["description"] = "Removes all items from a specific to-do list, deleting the list.";
+        JsonObject todoClearParams = clearTodoFunc.createNestedObject("parameters");
+        todoClearParams["type"] = "object";
+        JsonObject todoClearProps = todoClearParams.createNestedObject("properties");
+        todoClearProps["list_name"]["type"] = "string";
+        todoClearProps["list_name"]["description"] = "The name of the list to clear, e.g., 'groceries'.";
+        todoClearParams["required"][0] = "list_name";
+        
+    } // This is the closing brace for 'else' (non-vision) block
+
+    String requestBody;
+    serializeJson(doc, requestBody);
+    
+    HTTPClient http;
+    http.begin(chatgpt_endpoint);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(OPENAI_API_KEY));
+    http.setTimeout(20000); 
+    int httpCode = http.POST(requestBody);
+
+    if (httpCode == HTTP_CODE_OK) {
+        String responsePayload = http.getString();
+        JsonDocument response_doc;
+        deserializeJson(response_doc, responsePayload);     
+        JsonObject choice = response_doc["choices"][0];
+        JsonObject message = choice["message"];     
+        
+        if (message.containsKey("tool_calls")) {
+            Serial.println("AI requested tool calls.");
+            
+            JsonArray toolCallsArray = message["tool_calls"].as<JsonArray>();
+            for (JsonObject toolCall : toolCallsArray) {
+                GptToolCall call; 
+                call.toolToCall = toolCall["function"]["name"].as<String>();
+                call.toolArguments = toolCall["function"]["arguments"].as<String>();
+                call.toolCallId = toolCall["id"].as<String>();
+                response.toolCalls.push_back(call); 
+            }
+            serializeJson(message, response.rawAssistantMessage);
+
+        } else {
+            response.textToSpeak = message["content"].as<String>();
+            response.textToSpeak.trim();
+        }
+    
+    } else { 
+        Serial.printf("[HTTP] POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+        
+        response.textToSpeak = "Oops! I'm having trouble connecting right now. Let me try again in a moment.";
+        
+        Serial.println("Failed request body:");
+        Serial.println(requestBody);
+        Serial.println("Failed response body:");
+        Serial.println(http.getString());
+    }
+    
+    http.end();
+    return response;
+}
+
+
+
+// Send audio buffer to OpenAI Whisper API for speech-to-text transcription
+// Returns transcribed text or empty string on error
+String transcribeWithWhisper(int audio_len, int16_t* audio_data) {
+    // If audio_data provided, use that (for chunk transcription)
+    // Otherwise use global audio_buffer (for full transcription)
+    if (audio_data == NULL) {
+        audio_data = audio_buffer;
+    }
+    
+    Serial.println("🧠 Transcribing with Whisper...");
+    currentAIState = AI_THINKING;
+    broadcastState(AI_THINKING);
+    updateAnimation();
+
+    String transcription = "";
+    WiFiClientSecure client;
+    client.setInsecure();
+    if (!client.connect(openai_host, 443)) {
+        Serial.println("Connection to OpenAI failed!");
+        return "";
+    }
+    String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    byte header[44];
+    createWavHeader(header, audio_len);
+    String pre_file_body = "--" + boundary + "\r\n"
+                                     "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+                                     "Content-Type: audio/wav\r\n\r\n";
+    String post_file_body = "\r\n--" + boundary + "\r\n"
+                                         "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+                                         "whisper-1\r\n"
+                                         "--" + boundary + "\r\n"
+                                         "Content-Disposition: form-data; name=\"language\"\r\n\r\n"
+                                         "en\r\n"
+                                         "--" + boundary + "--\r\n";
+    int total_len = pre_file_body.length() + sizeof(header) + audio_len + post_file_body.length();
+    
+    client.println("POST " + String(whisper_endpoint) + " HTTP/1.1");
+    client.println("Host: " + String(openai_host));
+    client.println("Authorization: Bearer " + String(OPENAI_API_KEY));
+    client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+    client.println("Content-Length: " + String(total_len));
+    client.println();
+    client.print(pre_file_body);
+    client.write(header, sizeof(header));
+    int chunk_size = 4096;
+    for (int i = 0; i < audio_len; i += chunk_size) {
+        int size_to_write = min(chunk_size, audio_len - i);
+        client.write((uint8_t*)audio_data + i, size_to_write);  // Use passed-in audio_data pointer
+    }
+    client.print(post_file_body);
+    
+    unsigned long timeout = millis();
+    while (client.connected() && !client.available()) {
+        if (millis() - timeout > 30000UL) {
+            Serial.println("Client timeout!"); client.stop(); return "";
+        }
+        delay(1); updateAnimation();
+    }
+    
+    String response = "";
+    bool headersEnded = false;
+    while(client.available()){
+        String line = client.readStringUntil('\n');
+        if (!headersEnded) { if (line == "\r") headersEnded = true; } 
+        else { response += line; }
+    }
+    client.stop();
+
+    if (response.length() > 0) {
+        JsonDocument doc;
+        deserializeJson(doc, response);
+        if (doc.containsKey("text")) {
+            transcription = doc["text"].as<String>();
+        } else {
+             Serial.println("Error in Whisper response: " + response);
+        }
+    } else {
+        Serial.println("No response from Whisper API.");
+    }
+    return transcription;
+}
+
+// Speak the default introduction stored in flash memory
+// This is guaranteed to work even if all APIs fail
+void playAlarmTone() {
+    audio.setVolume(21);
+    // Use connecttohost to stream the alarm audio and set it to loop
+    audio.connecttohost("https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3");
+}
+
+void speakDefaultIntroduction() {
+    // Read the default introduction from flash memory (PROGMEM)
+    char introBuffer[256];
+    strcpy_P(introBuffer, DEFAULT_INTRODUCTION);
+    String intro = String(introBuffer);
+    
+    speakText(intro);
+}
+
+void speakText(String text) {
+    Serial.println("📢 Speaking...");
+    AIState previousState = currentAIState;
+    currentAIState = AI_SPEAKING;
+    broadcastState(AI_SPEAKING);
+    speaking_frame_index = 0;
+    audio.setVolume(21);
+    
+    time_t currentTime = time(nullptr);
+    if (currentTime < 24 * 3600) {
+        // ... (existing NTP sync wait code) ...
+    }
+    
+    int last_index = 0;
+    for (int i = 0; i <= text.length(); i++) {
+        if (introSpoken) {
+            if (touchRead(BUTTON_PIN) > TOUCH_THRESHOLD) {
+                Serial.println("✋ Speak interrupted by touch!");
+                audio.stopSong(); 
+                currentAIState = AI_IDLE;
+                broadcastState(AI_IDLE);
+                return; // Exit the entire speaking function
+            }
+        }
+
+        if (currentAIState == AI_ALARMING) {
+            return;
+        }
+        
+        if (i == text.length() || text[i] == '.' || text[i] == '!' || text[i] == '?') {
+            String sentence = text.substring(last_index, i + 1);
+            sentence.trim();
+            if (sentence.length() > 0) {
+                audio.connecttospeech(sentence.c_str(), "en");
+                
+                unsigned long speech_timeout = millis();
+                bool was_running = false;
+                
+                while ((millis() - speech_timeout < 30000)) { 
+                    if (introSpoken) {
+                        if (touchRead(BUTTON_PIN) > TOUCH_THRESHOLD) {
+                            audio.stopSong();
+                            currentAIState = AI_IDLE;
+                            broadcastState(AI_IDLE);
+                            return; 
+                        }
+                    }
+
+                    if (currentAIState == AI_ALARMING) {
+                        audio.stopSong();
+                        return;
+                    }
+                    
+                    server.handleClient(); 
+                    webSocket.loop();
+                    audio.loop(); 
+                    updateAnimation(); 
+                    yield();
+                    
+                    if (audio.isRunning()) {
+                        was_running = true;
+                    } else if (was_running) {
+                        delayMicroseconds(100000); 
+                        break;
+                    }
+                }
+            }
+            last_index = i + 1;
+        }
+    }
+    currentAIState = previousState;
+    broadcastState(previousState);
+}
+
+String handleTimeDateRequest() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        return "Sorry, I couldn't get the current time.";
+    }
+    char buffer[80];
+    strftime(buffer, sizeof(buffer), "%I:%M %p on %A, %B %d, %Y", &timeinfo);
+    String timeStr = String(buffer);
+    if (timeStr.startsWith("0")) timeStr = timeStr.substring(1);
+    return "It's " + timeStr + " right now!";
+}
+
+String handleWeatherRequest(String city) {
+    city.replace(" ", "%20");
+    String path = String(weather_endpoint) + "?q=" + city + "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric";
+    String fullUrl = "https://" + String(weather_host) + path;
+    HTTPClient http;
+    http.begin(fullUrl);
+    int httpCode = http.GET();
+    String weatherReport = "";
+    
+    if (httpCode == HTTP_CODE_OK) {
+        JsonDocument doc;
+        deserializeJson(doc, http.getString());
+        if (doc.containsKey("weather")) {
+            String description = doc["weather"][0]["description"];
+            float temp = doc["main"]["temp"];
+            String cityName = doc["name"];
+            weatherReport = "The weather in " + cityName + " is currently " + description;
+            weatherReport += " with a temperature of " + String((int)round(temp)) + " degrees Celsius.";
+        } else {
+            weatherReport = "Sorry, I couldn't find weather for " + city;
+        }
+    } else {
+        Serial.printf("[HTTP] GET failed for weather, error: %s\n", http.errorToString(httpCode).c_str());
+        weatherReport = "Sorry, I could not get the weather information.";
+    }
+    http.end();
+    return weatherReport;
+}
+
+void createWavHeader(byte* header, int wavDataSize) {
+    header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+    unsigned int fileSize = wavDataSize + 36;
+    header[4] = (byte)(fileSize & 0xFF); header[5] = (byte)((fileSize >> 8) & 0xFF); header[6] = (byte)((fileSize >> 16) & 0xFF); header[7] = (byte)((fileSize >> 24) & 0xFF);
+    header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+    header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+    header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+    header[20] = 1; header[21] = 0;
+    header[22] = 1; header[23] = 0;
+    unsigned int sampleRate = SAMPLE_RATE;
+    header[24] = (byte)(sampleRate & 0xFF); header[25] = (byte)((sampleRate >> 8) & 0xFF); header[26] = 0; header[27] = 0;
+    unsigned int byteRate = SAMPLE_RATE * 2;
+    header[28] = (byte)(byteRate & 0xFF); header[29] = (byte)((byteRate >> 8) & 0xFF); header[30] = 0; header[31] = 0;
+    header[32] = 2; header[33] = 0;
+    header[34] = 16; header[35] = 0;
+    header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+    header[40] = (byte)(wavDataSize & 0xFF); header[41] = (byte)((wavDataSize >> 8) & 0xFF); header[42] = (byte)((wavDataSize >> 16) & 0xFF); header[43] = (byte)((wavDataSize >> 24) & 0xFF);
+}
+
+void drawEye(int centerX, int centerY, int w, int h, float px, float py) {
+  int topLeftX = centerX - w / 2;
+  int topLeftY = centerY - h / 2;
+  u8g2.drawRBox(topLeftX, topLeftY, w, h, 6);
+  if (h > pupilRadius + 2) {
+    u8g2.setDrawColor(0);
+    u8g2.drawDisc(centerX + px, centerY + py, pupilRadius);
+    u8g2.setDrawColor(1);
+  }
+}
+
+void drawBlink(int centerX, int centerY, int w) {
+  int topLeftX = centerX - w / 2;
+  u8g2.drawBox(topLeftX, centerY - 2, w, 4);
+}
+
+void drawEyebrow(int centerX, int browY, int w, float offset) {
+  int topLeftX = centerX - w / 2;
+  int browWidth = w - 4;
+  u8g2.drawLine(topLeftX, browY + 2 + offset, topLeftX + browWidth / 2, browY + offset);
+  u8g2.drawLine(topLeftX + browWidth / 2, browY + offset, topLeftX + browWidth, browY + 2 + offset);
+}
+
+void showLoadingScreen(String status) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(15, 20, "KIKO");
+    
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(0, 35, "Initializing...");
+    u8g2.drawStr(0, 50, status.c_str());
+    
+    // Simple loading animation dots
+    unsigned long elapsed = millis() % 1500;
+    int dots = (elapsed / 300) % 4;
+    String dotStr = "";
+    for (int i = 0; i < dots; i++) dotStr += ".";
+    u8g2.drawStr(100, 50, dotStr.c_str());
+    u8g2.sendBuffer();
+}
+
+// ========== DISPLAY & ANIMATION ENGINE ==========
+// OLED rendering: eyes, status, network info, and state-based visuals
+
+void updateAnimation() {
+    u8g2.clearBuffer();
+    
+    setLedState(currentAIState);
+    unsigned long now = millis(); 
+    
+    // Display surveillance mode with REC indicator
+    if (currentAIState == AI_SURVEILLANCE) {
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 35, "SURVEILLANCE");
+        if (millis() % 1000 < 500) {
+            u8g2.drawDisc(115, 10, 5); // Flashing REC dot
+        }
+        u8g2.sendBuffer();
+        return; // Stop here so it doesn't draw eyes
+    }
+
+    // Display network credentials if requested (show for 10 seconds)
+    if (showNetworkInfo && (now - networkInfoStartTime < 10000)){
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 15, "Network Info");
+        
+        u8g2.setFont(u8g2_font_6x10_tr);
+        String ssidLabel = "WiFi: " + WiFi.SSID();
+        u8g2.drawStr(0, 30, ssidLabel.c_str());
+        
+        String ipLabel = "IP: " + WiFi.localIP().toString();
+        u8g2.drawStr(0, 45, ipLabel.c_str());
+        
+        long rssi = WiFi.RSSI();
+        String signalLabel = "Signal: " + String(rssi) + " dBm";
+        u8g2.drawStr(0, 60, signalLabel.c_str());
+        
+        u8g2.sendBuffer();
+        return;
+    } else if (showNetworkInfo && (now - networkInfoStartTime >= 15000)) {
+        showNetworkInfo = false;  // Timeout expired, stop showing
+    }
+    
+    if (currentAIState == AI_ALARMING) {
+        u8g2.setFont(u8g2_font_logisoso24_tn);
+        int textWidth = u8g2.getStrWidth("ALARM!");
+        u8g2.drawStr((128 - textWidth) / 2, 35, "ALARM!");
+        
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(12, 55, "Tap to dismiss");
+    } else if (isWeatherTask) {
+        
+        u8g2.drawXBM(0, 0, 128, 64, weather_icon);
+    } else if (isTimeDateTask) {
+        
+        u8g2.drawXBM(0, 0, 128, 64, time_date_icon);
+    } else if (currentAIState == AI_LISTENING) {
+        
+        u8g2.drawXBM(0, 0, 128, 64, mic_icon);
+    } else if (currentAIState == AI_SPEAKING) {
+        
+        if (now - last_speaking_frame_time > FRAME_DELAY) {
+            last_speaking_frame_time = now;
+            speaking_frame_index = (speaking_frame_index + 1) % SPEAKING_FRAME_COUNT;
+        }
+        u8g2.drawXBM(40, 8, FRAME_WIDTH, FRAME_HEIGHT, speaking_frames[speaking_frame_index]);
+    } else {
+        
+        if (currentAIState == AI_IDLE) {  
+            switch (currentIdleDisplay) {
+                case IDLE_EYES:
+                    { 
+                        isBlinking = false;
+                        float pupilSpeed = 0.05; float browSpeed = 0.05; float horRange = 4; float verRange = 2; targetBrowOffset = 0;
+
+                        if (now - lastMoveTime > random(1000, 2500)) {
+                           targetPupilX = horRange * cos(random(0, 360) * 3.14 / 180.0);
+                           targetPupilY = verRange * sin(random(0, 360) * 3.14 / 180.0);
+                           lastMoveTime = now;
+                        }
+                        pupilX += (targetPupilX - pupilX) * pupilSpeed;
+                        pupilY += (targetPupilY - pupilY) * pupilSpeed;
+                        browOffsetLeft += (targetBrowOffset - browOffsetLeft) * browSpeed;
+                        browOffsetRight += (targetBrowOffset - browOffsetRight) * browSpeed;
+
+                        drawEye(leftEyeX, eyeY, eyeWidth, eyeHeight, pupilX, pupilY);
+                        drawEye(rightEyeX, eyeY, eyeWidth, eyeHeight, pupilX, pupilY);
+                        drawEyebrow(leftEyeX, eyeY - eyeHeight / 2 - 7, eyeWidth, browOffsetLeft);
+                        drawEyebrow(rightEyeX, eyeY - eyeHeight / 2 - 7, eyeWidth, browOffsetRight);
+                    }
+                    break; 
+
+                case IDLE_INFO: 
+                    {
+                        
+                        struct tm timeinfo;
+                        if (getLocalTime(&timeinfo)) {
+                            char timeHourMin[6]; 
+                            char dateStr[12];    
+                            strftime(timeHourMin, sizeof(timeHourMin), "%H:%M", &timeinfo);
+                            strftime(dateStr, sizeof(dateStr), "%b %d", &timeinfo); 
+
+                            u8g2.setFont(u8g2_font_logisoso24_tn); 
+                            int timeWidth = u8g2.getStrWidth(timeHourMin);
+                            u8g2.drawStr((128 - timeWidth) / 2, 35, timeHourMin); 
+
+                            u8g2.setFont(u8g2_font_ncenB10_tr); 
+                            int dateWidth = u8g2.getStrWidth(dateStr);
+                            u8g2.drawStr((128 - dateWidth) / 2, 55, dateStr); 
+                        } else {
+                            
+                            u8g2.setFont(u8g2_font_ncenB10_tr);
+                            u8g2.drawStr(20, 35, "Time N/A");
+                        }
+
+                        
+                        long rssi = WiFi.RSSI();
+                        int bars = 0;
+                        
+                        if (rssi >= -60) { bars = 4; }       
+                        else if (rssi >= -70) { bars = 3; }  
+                        else if (rssi >= -80) { bars = 2; }  
+                        else if (rssi >= -90) { bars = 1; }  
+                        else { bars = 0; }                   
+
+                        
+                        int barX = 115; 
+                        int barY = 5;   
+                        int barW = 3;   
+                        int barH[] = {2, 4, 6, 8}; 
+                        int barGap = 1; 
+
+                        for (int i = 0; i < 4; i++) {
+                            if (bars > i) {
+                                
+                                u8g2.drawBox(barX + i * (barW + barGap), barY + (barH[3] - barH[i]), barW, barH[i]);
+                            }   
+                        }
+                    }
+                    break; 
+            } 
+        } 
+        else if (currentAIState == AI_THINKING) {
+             
+             if (!isBlinking && (now - lastBlink > random(1000, 2500))) {
+                 isBlinking = true;
+                 blinkStart = now;
+                 lastBlink = now;
+             }
+             if (isBlinking && now - blinkStart > 180) {
+                 isBlinking = false;
+             }
+
+             float pupilSpeed = 0.12; float browSpeed = 0.10; float horRange = 8; float verRange = 4; targetBrowOffset = -3;
+
+             if (!isBlinking && now - lastMoveTime > random(1000, 2500)) {
+               targetPupilX = horRange * cos(random(0, 360) * 3.14 / 180.0);
+               targetPupilY = verRange * sin(random(0, 360) * 3.14 / 180.0);
+               lastMoveTime = now;
+             }
+             pupilX += (targetPupilX - pupilX) * pupilSpeed;
+             pupilY += (targetPupilY - pupilY) * pupilSpeed;
+             browOffsetLeft += (targetBrowOffset - browOffsetLeft) * browSpeed;
+             browOffsetRight += (targetBrowOffset - browOffsetRight) * browSpeed;
+
+             if (isBlinking) {
+                 drawBlink(leftEyeX, eyeY, eyeWidth);
+                 drawBlink(rightEyeX, eyeY, eyeWidth);
+             } else {
+                 drawEye(leftEyeX, eyeY, eyeWidth, eyeHeight, pupilX, pupilY);
+                 drawEye(rightEyeX, eyeY, eyeWidth, eyeHeight, pupilX, pupilY);
+             }
+             drawEyebrow(leftEyeX, eyeY - eyeHeight / 2 - 7, eyeWidth, browOffsetLeft);
+             drawEyebrow(rightEyeX, eyeY - eyeHeight / 2 - 7, eyeWidth, browOffsetRight);
+        } 
+
+    } 
+
+    u8g2.sendBuffer(); 
+}
